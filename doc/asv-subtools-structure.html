@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>ASV-Subtools 代码结构可视化</title>
+<style>
+  :root{
+    --bg:#0f172a; --panel:#1e293b; --line:#334155;
+    --shell:#f59e0b; --kaldi:#06b6d4; --pytorch:#a855f7;
+    --runtime:#ef4444; --score:#10b981; --recipe:#ec4899;
+    --doc:#64748b; --sub2:#3b82f6; --text:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 100%);color:var(--text);padding:32px;}
+  h1{font-size:28px;margin:0 0 6px;background:linear-gradient(90deg,#a855f7,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+  .subtitle{color:#94a3b8;margin-bottom:24px;font-size:14px;}
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:28px;}
+  .legend span{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,.04);
+               border:1px solid var(--line);border-radius:999px;font-size:12px;}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:18px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+        box-shadow:0 4px 14px rgba(0,0,0,.25);position:relative;overflow:hidden;}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,#64748b);}
+  .card h2{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px;}
+  .card .meta{color:#94a3b8;font-size:12px;margin-bottom:10px;}
+  .card ul{padding-left:0;margin:6px 0 0;list-style:none;font-size:13px;line-height:1.55;}
+  .card li{padding:3px 0;display:flex;gap:6px;}
+  .card li code{background:rgba(255,255,255,.06);padding:1px 6px;border-radius:4px;font-size:12px;color:#cbd5e1;}
+  .badge{font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(255,255,255,.08);color:#cbd5e1;}
+  .col-12{grid-column:span 12} .col-8{grid-column:span 8}
+  .col-6{grid-column:span 6} .col-4{grid-column:span 4} .col-3{grid-column:span 3}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;}
+  .chip{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:8px;
+        padding:8px 10px;font-size:12px;flex:1;min-width:140px;}
+  .chip b{display:block;color:#fff;font-size:13px;margin-bottom:2px;}
+  .arrow{text-align:center;color:#64748b;font-size:18px;margin:8px 0;}
+  .flowbox{display:flex;align-items:stretch;justify-content:space-between;gap:10px;margin-top:10px;}
+  .flowbox .step{flex:1;background:rgba(255,255,255,.04);border:1px dashed var(--line);
+                 border-radius:10px;padding:10px;font-size:12px;text-align:center;}
+  .flowbox .step b{display:block;color:#fff;margin-bottom:4px;font-size:13px;}
+  .flowbox .sep{align-self:center;color:#64748b;}
+  .pillrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
+  .pill{font-size:11px;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);
+        border:1px solid var(--line);color:#cbd5e1;}
+  footer{margin-top:28px;color:#64748b;font-size:12px;text-align:center;}
+</style>
+</head>
+<body>
+
+<h1>ASV-Subtools · 代码结构可视化</h1>
+<div class="subtitle">XMU Speech Lab &amp; TalentedSoft · 基于 Kaldi + PyTorch 的说话人识别 / 语种识别开源工具集</div>
+
+<div class="legend">
+  <span><i class="dot" style="background:var(--shell)"></i>Shell 工具脚本</span>
+  <span><i class="dot" style="background:var(--kaldi)"></i>Kaldi 分支</span>
+  <span><i class="dot" style="background:var(--pytorch)"></i>PyTorch 分支</span>
+  <span><i class="dot" style="background:var(--runtime)"></i>Runtime 部署</span>
+  <span><i class="dot" style="background:var(--score)"></i>打分 / 后端</span>
+  <span><i class="dot" style="background:var(--recipe)"></i>Recipe 配方</span>
+  <span><i class="dot" style="background:var(--sub2)"></i>SubTools v2 (egrecho)</span>
+  <span><i class="dot" style="background:var(--doc)"></i>配置 / 文档</span>
+</div>
+
+<!-- 顶层全景 -->
+<div class="grid">
+  <div class="card col-12" style="--accent:linear-gradient(180deg,#a855f7,#06b6d4)">
+    <h2>🌐 顶层全景：三大主干 + v2 重构</h2>
+    <div class="meta">README 中描述的「三大主干」(Shell + Kaldi + PyTorch) 加上新一代 <code>subtools2/egrecho</code> 框架。</div>
+    <div class="flowbox">
+      <div class="step" style="border-color:var(--shell)"><b>① 数据准备</b>Shell 脚本 + Kaldi<br/>VAD / 特征 / 数据增广</div>
+      <div class="sep">→</div>
+      <div class="step" style="border-color:var(--kaldi)"><b>② 传统建模</b>i-vector / TDNN<br/>多任务 / 迁移 x-vector</div>
+      <div class="sep">→</div>
+      <div class="step" style="border-color:var(--pytorch)"><b>③ 深度建模</b>x-vector / ECAPA / ResNet<br/>Transformer / RepVGG</div>
+      <div class="sep">→</div>
+      <div class="step" style="border-color:var(--score)"><b>④ 后端打分</b>PLDA / Cosine<br/>AS-Norm / 融合</div>
+      <div class="sep">→</div>
+      <div class="step" style="border-color:var(--runtime)"><b>⑤ 在线部署</b>JIT 模型导出<br/>C++ Runtime</div>
+    </div>
+  </div>
+</div>
+
+<div class="grid" style="margin-top:18px">
+
+  <!-- 根目录 Shell -->
+  <div class="card col-6" style="--accent:var(--shell)">
+    <h2>🟠 根目录 · Shell 工具脚本 <span class="badge">~50 .sh / .py</span></h2>
+    <div class="meta">数据预处理、VAD、特征拼接、向量过滤与融合、评估等流水线工具</div>
+    <ul>
+      <li>📁 <b>数据 / 特征</b> <code>makeFeatures.sh</code> <code>computeVad.sh</code> <code>augmentDataByNoise.sh</code> <code>pasteFeats.sh</code></li>
+      <li>📁 <b>切分 / 过滤</b> <code>filterDataDir.sh</code> <code>splitDataByLength.sh</code> <code>cutUttRandomFromFeats.sh</code></li>
+      <li>📁 <b>向量提取</b> <code>extractVector.sh</code> <code>combineVectordir.sh</code> <code>meanSpVector.sh</code></li>
+      <li>📁 <b>评估指标</b> <code>computeEER.sh</code> <code>computeCavg.py</code> <code>computeMin-t-DCF.py</code></li>
+      <li>📁 <b>融合</b> <code>fusionByLda.sh</code> <code>fusionBySvm.py</code> <code>greedyFusion.sh</code></li>
+      <li>📁 <b>评测主流程</b> <code>scoreSets.sh</code> · <code>runPytorchLauncher.sh → pytorch/launcher/runLauncher.sh</code></li>
+    </ul>
+  </div>
+
+  <!-- Kaldi -->
+  <div class="card col-6" style="--accent:var(--kaldi)">
+    <h2>🔵 kaldi/ · Kaldi 训练分支</h2>
+    <div class="meta">基于 Kaldi 的 i-vector / x-vector / 多任务 / 迁移学习训练入口与脚本补丁</div>
+    <ul>
+      <li>🎯 <b>训练入口 run*.sh</b>
+        <div class="pillrow">
+          <span class="pill">runIvector</span><span class="pill">runXvector</span>
+          <span class="pill">runDoubleXvector</span><span class="pill">runMultiTaskXvector</span>
+          <span class="pill">runPhoneticXvector</span><span class="pill">runTransferXvector</span>
+          <span class="pill">runXnet/Ynet</span>
+        </div>
+      </li>
+      <li>📂 <code>sid/</code> <code>steps/</code> <code>utils/</code> · Kaldi 标准目录的封装</li>
+      <li>📂 <code>steps_multitask/</code> · 多任务学习扩展步骤</li>
+      <li>📂 <code>patch/</code> · 对原生 Kaldi 的补丁</li>
+      <li>📂 <code>draw/</code> · 结果绘图工具</li>
+    </ul>
+  </div>
+
+  <!-- PyTorch 主分支 -->
+  <div class="card col-12" style="--accent:var(--pytorch)">
+    <h2>🟣 pytorch/ · PyTorch 训练分支（核心）</h2>
+    <div class="meta">自定义模型训练框架：Launcher → Pipeline → Libs(egs/nnet/training/support) → Model</div>
+
+    <div class="row">
+      <div class="chip" style="border-color:var(--pytorch)">
+        <b>📁 launcher/ <span class="badge">训练入口</span></b>
+        各模型一键训练脚本：<br/>
+        <span class="pill">runSnowdarXvector</span><span class="pill">runResnetXvector</span>
+        <span class="pill">runEcapaXvector</span><span class="pill">runRepvggXvector</span>
+        <span class="pill">runTransformerXvector</span><span class="pill">runFactoredXvector</span>
+        <span class="pill">runMultiTaskXvector</span><span class="pill">runEtdnn-FD-AL</span>
+        <span class="pill">multi_gpu/</span>
+      </div>
+      <div class="chip" style="border-color:var(--pytorch)">
+        <b>📁 model/ <span class="badge">模型蓝图</span></b>
+        每个 .py 即一个独立模型：<br/>
+        <span class="pill">xvector</span><span class="pill">extended_xvector</span>
+        <span class="pill">snowdar_xvector</span><span class="pill">resnet_xvector</span>
+        <span class="pill">ecapa_tdnn_xvector</span><span class="pill">repvgg_xvector</span>
+        <span class="pill">factored_xvector</span><span class="pill">transformer_xvector</span>
+        <span class="pill">multi_task_xvector_fix</span><span class="pill">snowdar-xvector-FD-AL</span>
+      </div>
+      <div class="chip" style="border-color:var(--pytorch)">
+        <b>📁 pipeline/ <span class="badge">数据→训练→导出</span></b>
+        <code>preprocess_to_egs.sh</code><br/>
+        <code>preprocess_wav_egs.sh</code><br/>
+        <code>extract_xvectors_for_pytorch.sh</code><br/>
+        <code>export_jit_model.sh</code><br/>
+        子目录：<span class="pill">onestep/</span><span class="pill">multitask/</span>
+      </div>
+      <div class="chip" style="border-color:var(--pytorch)">
+        <b>📁 bin/</b>
+        <code>print_model.py</code> · 模型查看工具
+      </div>
+    </div>
+
+    <div class="arrow">▼ libs/ — PyTorch 框架核心 ▼</div>
+
+    <div class="row">
+      <div class="chip" style="border-color:#22d3ee">
+        <b>📁 libs/egs/ <span class="badge">数据管线</span></b>
+        <span class="pill">egs.py</span><span class="pill">egs_online.py</span>
+        <span class="pill">egs_multi_task.py</span><span class="pill">egs_feature_decompsition.py</span>
+        <span class="pill">kaldi_dataset</span><span class="pill">kaldi_features</span>
+        <span class="pill">augmentation</span><span class="pill">speech_augment</span>
+        <span class="pill">signal_processing</span><span class="pill">samples</span><span class="pill">processor</span>
+      </div>
+      <div class="chip" style="border-color:#22d3ee">
+        <b>📁 libs/nnet/ <span class="badge">网络组件</span></b>
+        核心：<code>framework.py</code> (TopVirtualNnet 基类)<br/>
+        <span class="pill">components</span><span class="pill">activation</span><span class="pill">dropout</span>
+        <span class="pill">pooling</span><span class="pill">loss</span>
+        <span class="pill">resnet</span><span class="pill">repvgg</span>
+        <span class="pill">transformer/ (attention, encoder, mask, embedding…)</span>
+      </div>
+      <div class="chip" style="border-color:#22d3ee">
+        <b>📁 libs/training/ <span class="badge">训练循环</span></b>
+        <span class="pill">trainer</span><span class="pill">trainer_online</span>
+        <span class="pill">trainer_online_sam</span><span class="pill">trainer_mt</span>
+        <span class="pill">trainer_fd</span>
+        <span class="pill">optim / optim_fd</span>
+        <span class="pill">lr_scheduler / lr_finder</span><span class="pill">reporter</span>
+      </div>
+      <div class="chip" style="border-color:#22d3ee">
+        <b>📁 libs/support/ <span class="badge">基础设施</span></b>
+        <span class="pill">utils</span> (公共函数)
+        <span class="pill">kaldi_io / kaldi_common</span>
+        <span class="pill">GPU_Manager</span><span class="pill">sync_bn</span>
+        <span class="pill">prefetch_generator</span><span class="pill">logging_stdout</span>
+        <span class="pill">figure</span><span class="pill">clever_format</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- score -->
+  <div class="card col-6" style="--accent:var(--score)">
+    <h2>🟢 score/ · 后端打分与归一化</h2>
+    <ul>
+      <li><code>score.sh</code> · 总入口  &nbsp; <code>process.sh</code></li>
+      <li><code>ScoreNormalization.py</code> · S-Norm / AS-Norm</li>
+      <li>📂 <code>pyplda/</code> · Python 实现的 PLDA</li>
+      <li>📂 <code>gmm/</code> · MMI-GMM 后端分类器</li>
+      <li>📂 <code>svm/</code> · SVM 融合后端</li>
+      <li>📂 <code>whiten/</code> · 白化变换</li>
+      <li>📂 <code>metric/</code> · <code>getEER.sh</code> <code>getCavg.sh</code> <code>getMintDCF.sh</code> <code>getAsvspoofEER.sh</code></li>
+    </ul>
+  </div>
+
+  <!-- runtime -->
+  <div class="card col-6" style="--accent:var(--runtime)">
+    <h2>🔴 runtime/ · C++ 在线部署</h2>
+    <div class="meta">基于 LibTorch 的 JIT 推理引擎，对接前端特征流水线</div>
+    <ul>
+      <li>📂 <code>bin/</code> <code>extractor_main.cc</code> — 命令行入口</li>
+      <li>📂 <code>extractor/</code> <code>torch_asv_extractor.{h,cc}</code> · <code>torch_asv_model.{h,cc}</code> · <code>params.h</code></li>
+      <li>📂 <code>frontend/</code> <code>feature_pipeline.{h,cc}</code> · <code>features.{h,cc}</code> · <code>wav.h</code></li>
+      <li>📂 <code>kaldifeat/</code> · Kaldi 兼容特征实现</li>
+      <li>📂 <code>cmake/</code> <code>utils/</code> <code>test/</code> · 构建与测试</li>
+      <li>🛠 <code>CMakeLists.txt</code> 构建系统</li>
+    </ul>
+  </div>
+
+  <!-- recipes -->
+  <div class="card col-12" style="--accent:var(--recipe)">
+    <h2>🩷 recipe/ · 数据集 Recipe 配方</h2>
+    <div class="row">
+      <div class="chip"><b>voxceleb/</b>VoxCeleb1/2 标准与扩展 x-vector，含 SpecAug + AM-Softmax 变体</div>
+      <div class="chip"><b>voxcelebSRC/</b>ResNet34 + fbank-81 benchmark，online 版本</div>
+      <div class="chip"><b>cnsrc/</b>CNSRC 2022 中文说话人识别基线</div>
+      <div class="chip"><b>ap-olr / ap-olr2020-baseline</b>东方语种识别（OLR）基线</div>
+      <div class="chip"><b>olr2021-baseline</b>OLR 2021 多语种识别</div>
+    </div>
+  </div>
+
+  <!-- subtools2 -->
+  <div class="card col-12" style="--accent:var(--sub2)">
+    <h2>🔷 subtools2/ · 新一代框架 (egrecho)</h2>
+    <div class="meta">基于 PyTorch Lightning 风格的现代化重构，标准 Python 包结构（<code>setup.py</code> / <code>requirements/</code> / <code>docs/</code>）</div>
+
+    <div class="row">
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/core/ <span class="badge">框架内核</span></b>
+        <span class="pill">model_base</span><span class="pill">module</span>
+        <span class="pill">config / parser / pl_parser</span>
+        <span class="pill">data_builder</span><span class="pill">feature_extractor</span>
+        <span class="pill">tokenizer</span><span class="pill">teacher</span>
+        <span class="pill">loads</span><span class="pill">optimization/</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/data/</b>
+        <span class="pill">builder/ (asv, voyages)</span>
+        <span class="pill">datasets/audio</span>
+        <span class="pill">processors/ (batcher, opener, tararchiveloader…)</span>
+        <span class="pill">iterable/ · features/ · dew/</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/models/</b>
+        <span class="pill">architecture/speaker</span>
+        <span class="pill">ecapa (ecapa_xvector + config)</span>
+        <span class="pill">campplus</span>
+        <span class="pill">groups</span>
+        <span class="pill">valle (TTS task)</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/nn/</b>
+        <span class="pill">components</span><span class="pill">activation</span>
+        <span class="pill">pooling</span><span class="pill">classifier</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/training/</b>
+        <span class="pill">callbacks</span><span class="pill">average_models</span>
+        <span class="pill">optimizers/</span><span class="pill">lr_schedulers/</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/score/</b>
+        <span class="pill">score</span><span class="pill">asnorm</span>
+        <span class="pill">binary_metrics</span><span class="pill">wer</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/pipeline/</b>
+        <span class="pill">base</span><span class="pill">speaker_embedding</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho/utils/</b>
+        <span class="pill">io</span><span class="pill">dist · cuda_utils</span>
+        <span class="pill">data_utils · mask · seeder</span>
+        <span class="pill">register · imports · patch</span>
+        <span class="pill">text · logging · misc</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 egrecho_cli/</b>命令行工具入口（与包并列）</div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 recipes/</b>
+        <span class="pill">voxcelebSRC</span><span class="pill">cnsrc</span>
+        <span class="pill">whisper_finetune</span><span class="pill">vall-e</span>
+      </div>
+      <div class="chip" style="border-color:#60a5fa">
+        <b>📁 scripts/ · docs/</b>辅助脚本 & 项目文档</div>
+    </div>
+  </div>
+
+  <!-- 配置 / 文档 / linux -->
+  <div class="card col-4" style="--accent:var(--doc)">
+    <h2>⚙️ conf/</h2>
+    <ul>
+      <li>声学特征：<code>fbank-40/81/160</code> <code>mfcc-20/23/40</code> <code>plp</code> <code>spectrogram</code> <code>pitch</code></li>
+      <li>VAD：<code>vad-5.0 / 5.5.conf</code></li>
+      <li>训练 YAML：<code>egs_pre_sre*.yaml</code> (ECAPA / Transformer / LM…)</li>
+      <li>语音增广：<code>speech_aug_*.yaml</code></li>
+    </ul>
+  </div>
+  <div class="card col-4" style="--accent:var(--doc)">
+    <h2>📘 doc/</h2>
+    <ul>
+      <li>项目结构图、训练框架图、数据 pipeline 图</li>
+      <li>《ASV-Subtools 声纹识别实战手册 v1.0》PDF</li>
+      <li>📂 <code>papers/</code> 相关论文</li>
+      <li>Runtime 部署示意图、二维码与 logo</li>
+    </ul>
+  </div>
+  <div class="card col-4" style="--accent:var(--doc)">
+    <h2>🐧 linux/ · 系统工具</h2>
+    <ul>
+      <li><code>functions.sh</code> · 公共 shell 函数</li>
+      <li><code>kill_pid_tree.sh</code> · 进程树清理</li>
+      <li><code>generate_html_table_for_markdown.sh</code></li>
+      <li><code>decode_symbolic_link.sh</code></li>
+      <li>📂 <code>base/</code></li>
+    </ul>
+  </div>
+
+  <!-- 数据流 -->
+  <div class="card col-12" style="--accent:linear-gradient(180deg,#06b6d4,#a855f7)">
+    <h2>🔁 端到端数据流（PyTorch 分支视角）</h2>
+    <div class="flowbox">
+      <div class="step"><b>原始 wav</b>recipe/*/prepare<br/>Kaldi data dir</div>
+      <div class="sep">→</div>
+      <div class="step"><b>特征 / VAD</b>makeFeatures.sh<br/>computeVad.sh</div>
+      <div class="sep">→</div>
+      <div class="step"><b>egs 数据</b>pytorch/pipeline/<br/>preprocess_*_egs.sh</div>
+      <div class="sep">→</div>
+      <div class="step"><b>训练</b>libs/training/trainer*<br/>+ libs/nnet/framework</div>
+      <div class="sep">→</div>
+      <div class="step"><b>提取 x-vector</b>extract_xvectors_for_pytorch.sh</div>
+      <div class="sep">→</div>
+      <div class="step"><b>后端 / 评测</b>score/ + computeEER / Cavg / minDCF</div>
+      <div class="sep">→</div>
+      <div class="step"><b>部署</b>export_jit_model.sh<br/>→ runtime/ (C++)</div>
+    </div>
+  </div>
+
+</div>
+
+<footer>Generated structural map of <code>asv-subtools</code> · 颜色按模块职能分组 · 仅展示目录与关键文件，便于快速定位</footer>
+
+</body>
+</html>

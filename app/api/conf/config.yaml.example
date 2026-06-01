@@ -1,0 +1,62 @@
+# ASV API Configuration
+# Override any setting with environment variable: ASV_<SECTION>_<KEY>
+# Example: ASV_MODEL_PATH=./models/campplus.onnx
+#          ASV_SERVER_PORT=8080
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 4
+  log_level: info
+  max_request_size_mb: 50
+
+model:
+  # Path to the ONNX model file
+  path: ./models/campplus.onnx
+  # Execution provider (CPUExecutionProvider, CUDAExecutionProvider, CoreMLExecutionProvider)
+  provider: CPUExecutionProvider
+  provider_options: {}
+  inter_op_threads: 4
+  intra_op_threads: 4
+  # Seconds between hot-reload checks (0 to disable)
+  hot_reload_interval_sec: 30
+
+audio:
+  target_sample_rate: 16000
+  min_duration_sec: 0.5
+  max_duration_sec: 60.0
+  vad_enabled: true
+  vad_window_ms: 30
+  vad_threshold: 0.5
+  fbank_num_filters: 80
+  fbank_window_ms: 25
+  fbank_hop_ms: 10
+
+verification:
+  default_threshold: 0.6
+  scoring_method: cosine         # cosine | euclidean | dot_product
+  normalize_embeddings: true
+
+cache:
+  enabled: false                  # Set true to enable embedding cache
+  backend: redis                  # redis | memory
+  redis_url: redis://localhost:6379/0
+  ttl_sec: 86400                  # 24 hours
+  max_entries: 100000             # For memory backend only
+
+storage:
+  default_backend: nas
+  nas_mount_path: /mnt/recordings
+  s3_endpoint: ""
+  s3_bucket: ""
+  s3_access_key: ""
+  s3_secret_key: ""
+
+thresholds:
+  customer_service: 0.45
+  debt_collection: 0.70
+  audit: null                     # null = score only, no threshold decision
+
+metrics:
+  enabled: true
+  prometheus_port: 8001

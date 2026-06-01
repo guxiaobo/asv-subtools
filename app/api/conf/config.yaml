@@ -1,0 +1,49 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 1
+  log_level: debug
+
+model:
+  # 模型文件路径（唯一必要项）
+  path: ./models/campplus.onnx
+  # 以下为通用推理参数（所有模型共用）
+  provider: CPUExecutionProvider
+  provider_options: {}
+  inter_op_threads: 2
+  intra_op_threads: 2
+  # 模型输入/输出 tensor 名由 Verifier 运行时从 ONNX 元数据自动检测
+
+audio:
+  target_sample_rate: 16000
+  min_duration_sec: 0.5
+  max_duration_sec: 30.0
+  vad_enabled: false
+  fbank_num_filters: 80
+  fbank_window_ms: 25
+  fbank_hop_ms: 10
+
+fetcher:
+  # 只指定类型，具体参数由各 fetcher 子类自身维护
+  type: local_file
+
+verification:
+  default_threshold: 0.6
+  scoring_method: cosine
+  normalize_embeddings: true
+
+cache:
+  enabled: false
+  backend: redis
+  redis_url: redis://localhost:6379/0
+  ttl_sec: 600
+  max_entries: 10000
+
+storage:
+  default_backend: nas
+  nas_mount_path: /mnt/recordings
+
+thresholds:
+  customer_service: 0.45
+  debt_collection: 0.70
+  audit: 0.50

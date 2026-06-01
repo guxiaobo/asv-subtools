@@ -4,3 +4,11 @@
 /develop
 __pycache__
 *.pyc
+.DS_Store
+/app/test_data
+/app/sdk/java/target
+/app/release/asv-api/requirements-cached
+*.onnx
+*.gz
+/app/release
+*.rdb
