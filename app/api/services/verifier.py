@@ -11,6 +11,7 @@ Orchestrates:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
@@ -79,6 +80,45 @@ class SpeakerVerifier:
             self._ver_config.default_threshold,
             self._ver_config.scoring_method,
         )
+
+    # ------------------------------------------------------------------
+    # Audio source resolution (for the router)
+    # ------------------------------------------------------------------
+
+    @property
+    def audio_loader(self) -> AudioLoader:
+        """Expose the underlying audio loader (read-only)."""
+        return self._audio_loader
+
+    def resolve_audio_to_bytes(
+        self,
+        *,
+        url: Optional[str] = None,
+        audio_id: Optional[str] = None,
+        backend: str = "nas",
+        bucket: Optional[str] = None,
+    ) -> bytes:
+        """
+        Resolve a synchronous audio source to WAV bytes.
+
+        Priority within this method: ``url`` > ``audio_id``.
+        Does **not** handle file uploads (those are async and resolved
+        in the router).
+
+        Returns:
+            WAV bytes suitable for ``verify_from_bytes``.
+
+        Raises:
+            AudioLoadError: If no source resolves.
+        """
+        from services.audio import AudioLoadError
+
+        if url is not None:
+            return self._audio_loader.download_url(url)
+        if audio_id is not None:
+            audio = self._audio_loader.load_by_id(audio_id, backend=backend, bucket=bucket)
+            return audio.to_wav_bytes()
+        raise AudioLoadError("No audio source provided (url or audio_id)")
 
     # ------------------------------------------------------------------
     # Public API
@@ -266,6 +306,57 @@ class SpeakerVerifier:
             ),
             scenario=scenario,
             elapsed_ms=elapsed_ms,
+        )
+
+    def verify_from_urls(
+        self,
+        url_a: str,
+        url_b: str,
+        threshold: Optional[float] = None,
+        scoring_method: Optional[str] = None,
+        scenario: Optional[str] = None,
+    ) -> VerifyResponse:
+        """
+        Verify two speakers by downloading audio from HTTP(S) URLs.
+
+        Delegates to ``download_url`` on the audio loader (which caches
+        downloads locally keyed by MD5 of the URL), then processes the
+        bytes through the standard path.
+
+        Args:
+            url_a: HTTP/HTTPS URL for speaker A's audio.
+            url_b: HTTP/HTTPS URL for speaker B's audio.
+            threshold: Override the default decision threshold.
+            scoring_method: Override the default scoring method.
+            scenario: Business scenario for threshold selection.
+
+        Returns:
+            VerifyResponse with score and decision.
+        """
+        start_time = time.perf_counter()
+
+        # Download
+        try:
+            audio_bytes_a = self._audio_loader.download_url(url_a)
+            audio_bytes_b = self._audio_loader.download_url(url_b)
+        except Exception as e:
+            logger.exception("URL download failed")
+            return _error_response(
+                f"Audio download error: {e}", start_time, "AUDIO_DOWNLOAD_ERROR"
+            )
+
+        url_hash_a = hashlib.md5(url_a.encode("utf-8")).hexdigest()
+        url_hash_b = hashlib.md5(url_b.encode("utf-8")).hexdigest()
+
+        # Delegate to the bytes path (load → preprocess → embed → score)
+        return self.verify_from_bytes(
+            audio_bytes_a=audio_bytes_a,
+            audio_bytes_b=audio_bytes_b,
+            threshold=threshold,
+            scoring_method=scoring_method,
+            scenario=scenario,
+            audio_id_a=url_hash_a,
+            audio_id_b=url_hash_b,
         )
 
     # ------------------------------------------------------------------

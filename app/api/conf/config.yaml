@@ -42,6 +42,7 @@ cache:
 storage:
   default_backend: nas
   nas_mount_path: /mnt/recordings
+  download_dir: ./downloads
 
 thresholds:
   customer_service: 0.45

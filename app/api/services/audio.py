@@ -10,10 +10,12 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import struct
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
@@ -62,6 +64,37 @@ class AudioData:
     @property
     def num_samples(self) -> int:
         return len(self.waveform)
+
+    def to_wav_bytes(self) -> bytes:
+        """
+        Convert AudioData back to a PCM 16-bit mono WAV bytestring
+        with a proper RIFF/WAVE header.
+
+        This is the inverse of ``_decode_wav`` — useful when an audio
+        loaded via ID-based fetch needs to re-enter the bytes path
+        (e.g. for ``verify_from_bytes``).
+        """
+        import struct
+        pcm = (self.waveform * 32767.0).clip(-32768, 32767).astype(np.int16)
+        data = pcm.tobytes()
+        data_size = len(data)
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + data_size,  # total file size - 8
+            b"WAVE",
+            b"fmt ",
+            16,  # chunk size
+            1,  # PCM format
+            1,  # mono
+            self.sample_rate,
+            self.sample_rate * 2,  # byte rate
+            2,  # block align
+            16,  # bits per sample
+            b"data",
+            data_size,
+        )
+        return header + data
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +170,99 @@ class AudioLoader:
             audio_id=audio_id or path.stem,
             fmt=path.suffix.lstrip("."),
         )
+
+    # ------------------------------------------------------------------
+    # URL download mode
+    # ------------------------------------------------------------------
+
+    def download_url(self, url: str) -> bytes:
+        """
+        Download audio from a URL, cache to local disk, return raw bytes.
+
+        The local file is named ``<md5(url)><ext>`` and stored under
+        ``storage.download_dir`` (default: ``<api>/downloads/``).
+        Subsequent calls with the same URL skip the download.
+
+        Returns:
+            Raw audio bytes (suitable for ``verify_from_bytes``).
+
+        Raises:
+            AudioLoadError: If download fails.
+        """
+        url_hash = hashlib.md5(url.encode("utf-8")).hexdigest()
+
+        # Resolve download directory
+        raw_dir = self._storage_config.download_dir
+        if raw_dir:
+            download_dir = Path(raw_dir)
+        else:
+            # Fallback: <api>/downloads/
+            download_dir = Path(__file__).resolve().parent.parent / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Check local cache -------------------------------------------------
+        known_exts = [".wav", ".ulaw", ".alaw", ".mp3", ".flac", ".ogg", ".bin"]
+        for ext in known_exts:
+            cached = download_dir / f"{url_hash}{ext}"
+            if cached.exists():
+                logger.debug("URL cache HIT: %s -> %s", url, cached)
+                return cached.read_bytes()
+
+        # --- Download -----------------------------------------------------------
+        logger.info("Downloading audio from URL: %s", url)
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ASV-API/1.0 (SpeakerVerification)"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                audio_bytes = resp.read()
+        except Exception as e:
+            raise AudioLoadError(f"Failed to download audio from '{url}': {e}")
+
+        if not audio_bytes or len(audio_bytes) < 44:
+            raise AudioLoadError(
+                f"Downloaded audio from '{url}' is too small ({len(audio_bytes)} bytes)"
+            )
+
+        # --- Determine file extension ------------------------------------------
+        ext = self._infer_ext_from_url(url)
+        if not ext:
+            ext = self._infer_ext_from_bytes(audio_bytes)
+        if not ext:
+            ext = ".wav"  # safe default
+
+        save_path = download_dir / f"{url_hash}{ext}"
+        save_path.write_bytes(audio_bytes)
+        logger.info("URL download saved: %s -> %s (%d bytes)", url, save_path, len(audio_bytes))
+
+        return audio_bytes
+
+    @staticmethod
+    def _infer_ext_from_url(url: str) -> Optional[str]:
+        """Extract known audio extension from a URL path."""
+        from urllib.parse import urlparse
+        path = urlparse(url).path
+        ext = Path(path).suffix.lower()
+        known = {".wav", ".ulaw", ".alaw", ".mp3", ".flac", ".ogg", ".raw", ".pcm"}
+        return ext if ext in known else None
+
+    @staticmethod
+    def _infer_ext_from_bytes(data: bytes) -> Optional[str]:
+        """Sniff audio extension from header magic bytes."""
+        if len(data) < 4:
+            return None
+        if data[:4] == b"RIFF":
+            return ".wav"
+        if data[:4] == b"fLaC":
+            return ".flac"
+        if data[:3] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2") or data[:2] in (
+            b"\xff\xfb", b"\xff\xf3", b"\xff\xf2",
+        ):
+            return ".mp3"
+        if data[:4] == b"OggS":
+            return ".ogg"
+        return None
 
     # ------------------------------------------------------------------
     # Indirect mode — fetch by ID

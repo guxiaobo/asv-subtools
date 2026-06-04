@@ -160,6 +160,7 @@ class StorageConfig:
     s3_bucket: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
+    download_dir: str = ""  # empty => defaults to <api>/downloads/
 
 
 @dataclass
@@ -403,6 +404,7 @@ def dump_config(cfg: AppConfig) -> Dict[str, Any]:
             "default_backend": cfg.storage.default_backend,
             "nas_mount_path": cfg.storage.nas_mount_path,
             "s3_endpoint": cfg.storage.s3_endpoint or "",
+            "download_dir": cfg.storage.download_dir or "",
         },
         "thresholds": {
             "customer_service": cfg.thresholds.customer_service,

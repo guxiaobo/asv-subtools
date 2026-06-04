@@ -69,12 +69,30 @@ class VerifyDirectRequest(BaseModel):
 
 
 class IndirectAudioRef(BaseModel):
-    """Reference to an audio file stored externally."""
+    """Reference to an audio file stored externally or accessible via URL."""
 
-    audio_id: str = Field(..., min_length=1, max_length=256, description="Unique audio identifier")
+    audio_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=256,
+        description="Unique audio identifier (omit if url is provided)",
+    )
     storage_backend: StorageBackend = Field(default=StorageBackend.NAS)
     bucket: Optional[str] = Field(default=None, description="S3 bucket name (required for s3 backend)")
     format: Optional[str] = Field(default=None, description="Audio format hint, e.g. wav, ulaw")
+    url: Optional[str] = Field(default=None, description="HTTP/HTTPS URL to download audio from")
+
+    @model_validator(mode="after")
+    def check_audio_id_or_url(self) -> "IndirectAudioRef":
+        if not self.audio_id and not self.url:
+            raise ValueError("Either audio_id or url must be provided")
+        if self.audio_id and self.url:
+            raise ValueError("Provide either audio_id or url, not both")
+        return self
+
+    @model_validator(mode="after")
+    def check_audio_ids_differ(self) -> "IndirectAudioRef":
+        # This method exists only for the parent model validator;
+        # it's a no-op on individual refs.
+        return self
 
 
 class VerifyIndirectRequest(BaseModel):
@@ -89,9 +107,14 @@ class VerifyIndirectRequest(BaseModel):
     cache_ttl_sec: Optional[int] = Field(default=None, ge=60, le=2592000, description="Override cache TTL")
 
     @model_validator(mode="after")
-    def check_audio_ids_differ(self) -> "VerifyIndirectRequest":
-        if self.audio_a.audio_id == self.audio_b.audio_id:
-            raise ValueError("audio_a and audio_b must have different IDs")
+    def check_audio_refs_differ(self) -> "VerifyIndirectRequest":
+        # Compare by the same reference type: both URLs or both IDs
+        if self.audio_a.url and self.audio_b.url:
+            if self.audio_a.url == self.audio_b.url:
+                raise ValueError("audio_a and audio_b must have different URLs")
+        elif self.audio_a.audio_id and self.audio_b.audio_id:
+            if self.audio_a.audio_id == self.audio_b.audio_id:
+                raise ValueError("audio_a and audio_b must have different IDs")
         return self
 
 
