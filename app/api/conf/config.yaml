@@ -48,3 +48,14 @@ thresholds:
   customer_service: 0.45
   debt_collection: 0.70
   audit: 0.50
+
+# =============================================================
+# Training (录音推送数据库配置)
+# =============================================================
+training:
+  # 录音文件保存根目录（空 = 默认 <pkg_dir>/../data/local_recordings）
+  recordings_root: ""
+  # 预处理输出根目录（空 = 默认 <pkg_dir>/../data/preprocessed）
+  preprocessed_root: ""
+  # SQLite 数据库路径（空 = 默认 <pkg_dir>/../data/training.db）
+  db_path: ""

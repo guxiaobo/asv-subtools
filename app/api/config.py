@@ -177,6 +177,23 @@ class MetricsConfig:
 
 
 @dataclass
+class TrainingConfig:
+    recordings_root: str = ""
+    preprocessed_root: str = ""
+    db_path: str = ""
+
+    def resolve(self, pkg_dir: Path) -> None:
+        """Resolve empty paths to defaults under <pkg_dir>/../data/."""
+        data_root = pkg_dir.parent / "data"
+        if not self.recordings_root:
+            self.recordings_root = str(data_root / "local_recordings")
+        if not self.preprocessed_root:
+            self.preprocessed_root = str(data_root / "preprocessed")
+        if not self.db_path:
+            self.db_path = str(data_root / "training.db")
+
+
+@dataclass
 class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -187,6 +204,7 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     thresholds: ThresholdsConfig = field(default_factory=ThresholdsConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
     _model_md5: Optional[str] = None
 
@@ -325,6 +343,15 @@ def load_config_from_dict(data: Dict[str, Any]) -> AppConfig:
             if hasattr(cfg.metrics, k):
                 setattr(cfg.metrics, k, v)
 
+    # Training (recording storage)
+    if "training" in data:
+        for k, v in data["training"].items():
+            if hasattr(cfg.training, k) and not isinstance(v, dict):
+                setattr(cfg.training, k, v)
+
+    # Resolve training paths
+    cfg.training.resolve(_PKG_DIR)
+
     return cfg
 
 
@@ -413,3 +440,7 @@ def dump_config(cfg: AppConfig) -> Dict[str, Any]:
         },
     }
     return data
+
+
+# Module-level singleton: load config once at import time
+app_config: AppConfig = load_config()

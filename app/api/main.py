@@ -31,10 +31,12 @@ from fastapi.responses import JSONResponse
 from config import AppConfig, dump_config, load_config
 from onnx_model import ONNXModel
 from routers import health as health_router
+from routers import recordings as recordings_router
 from routers import verify as verify_router
 from services.audio import AudioLoader, AudioLoadError, InsufficientAudioError
 from services.cache import create_cache
 from services.fetcher import AudioFetcher
+from services.recording_db import init_db
 from services.verifier import SpeakerVerifier
 
 logger = logging.getLogger("asv-api")
@@ -124,6 +126,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     health_router.set_start_time(startup_time)
     verify_router.init_verifier(verifier)
 
+    # 7. Initialize training database (for recording push)
+    try:
+        await init_db(app_config.training.db_path)
+        logger.info("Training DB initialized: %s", app_config.training.db_path)
+    except Exception as e:
+        logger.warning("Training DB init failed: %s — recordings push will be unavailable", e)
+
     logger.info(
         "ASV API ready in %.2fs | %s | threshold=%.3f",
         time.time() - startup_time,
@@ -136,6 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Shutdown
     logger.info("Shutting down ASV API...")
     model.stop_hot_reload()
+    # Note: no global DB connection to close — each request uses its own.
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +182,7 @@ app.add_middleware(
 # Routers
 app.include_router(health_router.router)
 app.include_router(verify_router.router)
+app.include_router(recordings_router.router)
 
 
 # ---------------------------------------------------------------------------

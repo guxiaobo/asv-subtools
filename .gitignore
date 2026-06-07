@@ -13,3 +13,4 @@ __pycache__
 /app/release
 *.rdb
 /app/api/downloads
+/app/data
