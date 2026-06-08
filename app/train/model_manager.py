@@ -133,7 +133,11 @@ def publish_model(
 
     # 1. Copy as versioned file
     versioned_path = models_dir / f"{version}.onnx"
-    if Path(onnx_path).exists():
+    src_path = Path(onnx_path).resolve()
+    dst_path = versioned_path.resolve()
+    if src_path == dst_path:
+        logger.info("源路径和目标路径相同，跳过复制: %s", versioned_path)
+    elif Path(onnx_path).exists():
         shutil.copy2(onnx_path, str(versioned_path))
         logger.info("ONNX 已复制: %s → %s", onnx_path, versioned_path)
     else:
