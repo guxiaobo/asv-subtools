@@ -50,25 +50,30 @@ def energy_vad(
     sample_rate: int,
     window_ms: int = 30,
     threshold: float = 0.5,
-    min_segment_sec: float = 1.5,
-    max_segment_sec: float = 15.0,
+    min_segment_sec: float = 0.0,
+    max_segment_sec: float = 30.0,
     filter_leading_sec: float = 2.0,
-    snr_threshold: float = 15.0,
+    snr_threshold: float = 0.0,
+    lossless: bool = True,
 ) -> List[Segment]:
     """
     基于能量的 VAD 切割，适配电话录音。
 
     使用噪声底噪 + dB 增益自适应阈值，并对断开的语音段进行合并。
+    默认 lossless=True 保留所有分段（不丢弃短段，不按 SNR 过滤），
+    以满足「所有分段都不能丢失」的需求。
 
     Args:
         waveform: 输入波形 (float32, [-1, 1])。
         sample_rate: 采样率。
         window_ms: 帧长（毫秒）。
-        threshold: 原本的百分位阈值，当前已改为噪声底噪之上的 dB 阈值。
-        min_segment_sec: 最小段长（秒），< 此值的段丢弃。
+        threshold: 噪声底噪之上的 dB 阈值倍率（实际 dB = max(threshold*10, 3)）。
+        min_segment_sec: 最小段长（秒）。lossless=False 时有效，< 此值的段丢弃。
         max_segment_sec: 最大段长（秒），超过则切分。
         filter_leading_sec: 过滤开头的秒数（系统提示音）。
-        snr_threshold: 段 SNR 阈值（dB），低于此值的段丢弃。
+        snr_threshold: 段 SNR 阈值（dB）。lossless=False 时有效。
+        lossless: True=保留所有分段（忽略 min_segment_sec/snr_threshold）；
+                  False=过滤短段和低 SNR 段（原行为）。
 
     Returns:
         语音段列表，每段为 (waveform, start_sample, end_sample)。
@@ -118,11 +123,11 @@ def energy_vad(
     max_gap_samples = int(0.8 * sample_rate)  # merge if gap < 0.8s
     segments = _merge_segments(segments, max_gap_samples)
 
-    # 6. Filter by duration
-    segments = _filter_by_duration(segments, sample_rate, min_segment_sec, max_segment_sec)
-
-    # 7. Filter by SNR
-    segments = _filter_by_snr(segments, sample_rate, snr_threshold)
+    if not lossless:
+        # 6. Filter by duration (only in non-lossless mode)
+        segments = _filter_by_duration(segments, sample_rate, min_segment_sec, max_segment_sec)
+        # 7. Filter by SNR (only in non-lossless mode)
+        segments = _filter_by_snr(segments, sample_rate, snr_threshold)
 
     # 8. Convert to (waveform, start, end)
     result: List[Segment] = []
@@ -131,10 +136,10 @@ def energy_vad(
         result.append((seg_wav, start_s + filter_samples, end_s + filter_samples))
 
     logger.info(
-        "VAD: %d samples → %d segments (%.1fs total, threshold=%.2e, %.1f dB above noise)",
+        "VAD: %d samples → %d segments (%.1fs total, threshold=%.2e, %.1f dB above noise, lossless=%s)",
         len(waveform), len(result),
         sum(len(w) for w, _, _ in result) / sample_rate,
-        energy_threshold, db_gain,
+        energy_threshold, db_gain, lossless,
     )
     return result
 
@@ -280,10 +285,16 @@ def preprocess_recording(
     sample_rate: int = 16000,
     channel_separated: bool = False,
     apply_noise_reduction: bool = True,
+    # ── Diarizer integration (optional) ──
+    run_diarization: bool = True,
+    diarizer_model_name: str = "CAM++",
+    diarizer_db_path: Optional[str] = None,
+    diarizer_agent_threshold: Optional[float] = None,
+    diarizer_cluster_threshold: float = 0.55,
     **vad_kwargs,
 ) -> dict:
     """
-    对一条录音执行完整的训练前预处理。
+    对一条录音执行完整的训练前预处理 + 说话人标注。
 
     Args:
         audio_path: 原始录音文件路径。
@@ -291,6 +302,11 @@ def preprocess_recording(
         sample_rate: 目标采样率。
         channel_separated: 是否已通道分离。
         apply_noise_reduction: 是否应用降噪。
+        run_diarization: 是否在 VAD 后执行说话人标注（默认打开）。
+        diarizer_model_name: 声纹模型名（CAM++/ResNet34/ECAPA）。
+        diarizer_db_path: 数据库路径（默认自动）。
+        diarizer_agent_threshold: 坐席判定阈值（默认 None=动态检测）。
+        diarizer_cluster_threshold: 客户聚类阈值。
         **vad_kwargs: VAD 参数（覆盖默认值）。
 
     Returns:
@@ -311,11 +327,18 @@ def preprocess_recording(
         "customer_segments": 0,
         "agent_valid_sec": 0.0,
         "customer_valid_sec": 0.0,
+        "uncertain_segments": 0,
+        "uncertain_valid_sec": 0.0,
         "avg_snr_db": 0.0,
         "min_snr_db": 0.0,
         "max_snr_db": 0.0,
         "dropped_segments": 0,
         "dropped_reason": {},
+        # Diarization results
+        "diarization_done": False,
+        "diarization_model": diarizer_model_name,
+        "customer_voiceprint_available": False,
+        "customer_voiceprint_num_segments": 0,
     }
 
     # Load audio
@@ -335,10 +358,10 @@ def preprocess_recording(
     result["min_snr_db"] = overall_snr
     result["max_snr_db"] = overall_snr
 
-    # VAD
-    segments = energy_vad(waveform, sr, **vad_kwargs)
+    # VAD (lossless 模式 — 不丢弃任何段)
+    segments = energy_vad(waveform, sr, lossless=True, **vad_kwargs)
 
-    # Save segments (pass only waveform + index)
+    # Save segments
     prefix = Path(audio_path).stem
     seg_for_save = [(wav, i) for i, (wav, _, _) in enumerate(segments)]
     seg_paths = save_segments(output_dir, prefix, seg_for_save, sr)
@@ -353,16 +376,70 @@ def preprocess_recording(
         all_snr.append(snr_val)
 
     result["segment_count"] = len(segments)
-    result["agent_segments"] = len(segments)
-    result["agent_valid_sec"] = round(total_sec, 2)
     if all_snr:
         result["avg_snr_db"] = round(float(np.mean(all_snr)), 1)
         result["min_snr_db"] = round(float(np.min(all_snr)), 1)
         result["max_snr_db"] = round(float(np.max(all_snr)), 1)
 
+    # ── Diarization ──
+    if run_diarization and len(segments) > 0 and seg_paths:
+        try:
+            from train.diarizer import SpeakerDiarizer
+            seg_path_list = [Path(p) for p in seg_paths]
+            diarizer = SpeakerDiarizer(
+                model_path=None,
+                db_path=diarizer_db_path,
+                model_name=diarizer_model_name,
+                agent_threshold=diarizer_agent_threshold,
+                cluster_threshold=diarizer_cluster_threshold,
+            )
+            diar_results = diarizer.diarize(seg_path_list)
+            summary = diarizer.summarize(diar_results)
+
+            result["agent_segments"] = summary["agent_segments"]
+            result["customer_segments"] = summary["customer_segments"]
+            result["agent_valid_sec"] = summary["agent_valid_sec"]
+            result["customer_valid_sec"] = summary["customer_valid_sec"]
+            result["uncertain_segments"] = summary["uncertain_segments"]
+            result["uncertain_valid_sec"] = summary["uncertain_valid_sec"]
+            result["diarization_done"] = True
+
+            # Extract customer voiceprint
+            customer_vp = diarizer.get_customer_voiceprint(diar_results, seg_path_list)
+            if customer_vp is not None:
+                result["customer_voiceprint_available"] = True
+                result["customer_voiceprint_num_segments"] = customer_vp["num_segments"]
+                logger.info(
+                    "客户声纹提取成功: %d 段 centroid, dim=%d",
+                    customer_vp["num_segments"], len(customer_vp["embedding"]),
+                )
+            else:
+                logger.info("未提取到有效客户声纹（段数不足或因阈值过滤）")
+
+            logger.info(
+                "Diarization: agent=%d cust=%d uncert=%d (%.1f/%.1f/%.1f s)",
+                result["agent_segments"], result["customer_segments"],
+                result["uncertain_segments"],
+                result["agent_valid_sec"], result["customer_valid_sec"],
+                result["uncertain_valid_sec"],
+            )
+
+        except Exception as e:
+            logger.warning("Diarization failed for %s: %s — 使用默认标注", audio_path, e)
+            result["agent_segments"] = len(segments)
+            result["agent_valid_sec"] = round(total_sec, 2)
+    else:
+        # Default: all segments treated as agent (fallback)
+        result["agent_segments"] = len(segments)
+        result["agent_valid_sec"] = round(total_sec, 2)
+
     logger.info(
-        "Preprocessed %s: %d segments, %.1fs total, avg SNR=%.1f dB",
-        audio_path, result["segment_count"], total_sec, result["avg_snr_db"],
+        "Preprocessed %s: %d segments, %.1fs total, "
+        "agent=%d cust=%d uncertain=%d, avg SNR=%.1f dB%s",
+        audio_path, result["segment_count"], total_sec,
+        result["agent_segments"], result["customer_segments"],
+        result["uncertain_segments"], result["avg_snr_db"],
+        "  [diarized]" if result["diarization_done"] else "",
     )
 
     return result

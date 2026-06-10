@@ -61,6 +61,7 @@ async def init_db(db_path: Optional[str] = None) -> None:
                 audio_source_type TEXT  NOT NULL,
                 audio_original_url TEXT,
                 local_audio_path    TEXT,
+                file_hash       TEXT,
                 status          TEXT    NOT NULL DEFAULT 'raw',
                 pre_status      TEXT    DEFAULT 'pending',
                 pre_result      TEXT,
@@ -75,6 +76,24 @@ async def init_db(db_path: Optional[str] = None) -> None:
                 updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
             )
         """)
+
+        # Add file_hash column for existing databases (safe IF NOT EXISTS)
+        for alter_stmt in [
+            "ALTER TABLE recordings ADD COLUMN file_hash TEXT",
+        ]:
+            try:
+                await conn.execute(alter_stmt)
+            except Exception:
+                pass  # Column already exists
+
+        # Unique index for fast duplicate detection by hash
+        try:
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_recordings_file_hash "
+                "ON recordings(file_hash) WHERE file_hash IS NOT NULL"
+            )
+        except Exception:
+            pass
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS model_versions (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,6 +154,23 @@ async def _open_conn(db_path: Optional[str] = None) -> "aiosqlite.Connection":
 # ---------------------------------------------------------------------------
 
 
+async def get_recording_by_hash(
+    file_hash: str, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """通过文件 MD5 hash 查询已存在的录音记录。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT id, call_id, customer_phone, call_timestamp, local_audio_path, status "
+            "FROM recordings WHERE file_hash = ? LIMIT 1",
+            (file_hash,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
 async def insert_recording(
     *,
     biz_system: str,
@@ -145,6 +181,7 @@ async def insert_recording(
     audio_source_type: str,
     local_audio_path: Optional[str] = None,
     audio_original_url: Optional[str] = None,
+    file_hash: Optional[str] = None,
     channel_separated: bool = False,
     duration_sec: Optional[float] = None,
     db_path: Optional[str] = None,
@@ -170,10 +207,10 @@ async def insert_recording(
             """
             INSERT INTO recordings
                 (biz_system, call_id, agent_id, customer_phone, call_timestamp,
-                 audio_source_type, local_audio_path, audio_original_url,
+                 audio_source_type, local_audio_path, audio_original_url, file_hash,
                  channel_separated, duration_sec, status, pre_status, train_status,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'raw', 'pending', 'pending', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'raw', 'pending', 'pending', ?, ?)
             ON CONFLICT(call_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 customer_phone = excluded.customer_phone,
@@ -181,6 +218,7 @@ async def insert_recording(
                 audio_source_type = excluded.audio_source_type,
                 local_audio_path = excluded.local_audio_path,
                 audio_original_url = excluded.audio_original_url,
+                file_hash = excluded.file_hash,
                 channel_separated = excluded.channel_separated,
                 duration_sec = excluded.duration_sec,
                 updated_at = excluded.updated_at
@@ -194,6 +232,7 @@ async def insert_recording(
                 audio_source_type,
                 local_audio_path,
                 audio_original_url,
+                file_hash,
                 1 if channel_separated else 0,
                 duration_sec,
                 now,

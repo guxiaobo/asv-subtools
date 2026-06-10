@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from train.schemas import (
     PreprocessResult,
     PreprocessStatus,
@@ -98,12 +100,27 @@ CREATE TABLE IF NOT EXISTS model_versions (
 )
 """
 
+CREATE_SPEAKER_VOICEPRINTS_TABLE = """
+CREATE TABLE IF NOT EXISTS speaker_voiceprints (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name      TEXT    NOT NULL,
+    speaker_type    TEXT    NOT NULL CHECK(speaker_type IN ('agent', 'customer')),
+    speaker_id      TEXT    NOT NULL,
+    embedding       BLOB   NOT NULL,
+    segment_count   INTEGER DEFAULT 1,
+    source_call_ids TEXT,   -- JSON array of call_ids used
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status)",
     "CREATE INDEX IF NOT EXISTS idx_recordings_pre_status ON recordings(pre_status)",
     "CREATE INDEX IF NOT EXISTS idx_recordings_train_status ON recordings(train_status)",
     "CREATE INDEX IF NOT EXISTS idx_recordings_biz_agent ON recordings(biz_system, agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_model_versions_active ON model_versions(is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_speaker_vp_model ON speaker_voiceprints(model_name)",
+    "CREATE INDEX IF NOT EXISTS idx_speaker_vp_type ON speaker_voiceprints(speaker_type, speaker_id)",
 ]
 
 
@@ -111,6 +128,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     """初始化数据库表结构和索引。"""
     conn.execute(CREATE_RECORDINGS_TABLE)
     conn.execute(CREATE_MODEL_VERSIONS_TABLE)
+    conn.execute(CREATE_SPEAKER_VOICEPRINTS_TABLE)
     for idx in CREATE_INDEXES:
         try:
             conn.execute(idx)
@@ -473,6 +491,59 @@ def recover_stuck_tasks(conn: sqlite3.Connection, timeout_minutes: int = 30) -> 
         logger.warning("Recovered %d stuck 'processing' records", total)
     conn.commit()
     return total
+
+
+# ---------------------------------------------------------------------------
+# Voiceprint operations (speaker_voiceprints table)
+# ---------------------------------------------------------------------------
+
+
+def upsert_voiceprint(
+    conn: sqlite3.Connection,
+    *,
+    model_name: str,
+    speaker_type: str,
+    speaker_id: str,
+    embedding: np.ndarray,
+    segment_count: int = 1,
+    source_call_ids: Optional[List[str]] = None,
+) -> int:
+    """注册或更新声纹。embedding 应为已 L2 归一化的 float32 ndarray。"""
+    blob = embedding.astype(np.float32).tobytes()
+    call_ids_json = json.dumps(source_call_ids, ensure_ascii=False) if source_call_ids else None
+
+    # INSERT OR REPLACE: if same (model_name, speaker_type, speaker_id), replace
+    conn.execute(
+        """INSERT OR REPLACE INTO speaker_voiceprints
+           (model_name, speaker_type, speaker_id, embedding, segment_count, source_call_ids)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (model_name, speaker_type, speaker_id, blob, segment_count, call_ids_json),
+    )
+    conn.commit()
+    cursor = conn.execute(
+        "SELECT id FROM speaker_voiceprints WHERE model_name=? AND speaker_type=? AND speaker_id=?",
+        (model_name, speaker_type, speaker_id),
+    )
+    row = cursor.fetchone()
+    return row["id"] if row else -1
+
+
+def get_agent_voiceprint(
+    conn: sqlite3.Connection,
+    model_name: str = "CAM++",
+) -> Optional[Dict[str, Any]]:
+    """获取最近注册的坐席声纹。"""
+    row = conn.execute(
+        "SELECT * FROM speaker_voiceprints "
+        "WHERE model_name=? AND speaker_type='agent' "
+        "ORDER BY id DESC LIMIT 1",
+        (model_name,),
+    ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["embedding"] = np.frombuffer(result["embedding"], dtype=np.float32)
+    return result
 
 
 # ---------------------------------------------------------------------------

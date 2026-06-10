@@ -3,7 +3,7 @@
 # Copyright xmuspeech (Author: JFZhou 2019-11-18)
 # Update xmuspeech (Author: Fuchuan Tong 2020-12-31)
 
-import scipye
+import scipy as scipye
 import numpy as np
 import math
 import os

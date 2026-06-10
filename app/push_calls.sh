@@ -1,13 +1,19 @@
 #!/bin/zsh
 # =============================================================================
-# 录音推送脚本 — 将 /Users/guxiaobo/Downloads/calls/ 中的 .awb 录音文件
-# 通过 REST API 推送到 ASV 训练系统
+# 录音推送脚本 — 将 ~/Downloads/calls/ 中的录音文件通过 REST API
+# 推送到 ASV 训练系统
+#
+# API 会自动从文件名推导以下字段：
+#   - customer_phone: 第一个 '-' 前的字符串
+#   - call_timestamp: 时间戳 (YYMMDDHHMM → ISO 8601)
+#   - call_id: 完整文件名（不含扩展名）
 #
 # 用法:
 #   chmod +x push_calls.sh
 #   ./push_calls.sh                    # 推送所有文件
 #   ./push_calls.sh --dry-run          # 仅打印要推送的列表，不实际推送
 #   ./push_calls.sh --limit 3          # 只推送前 3 条
+#   ./push_calls.sh --format mp3       # 只推送 .mp3 文件
 # =============================================================================
 
 set -e
@@ -18,12 +24,21 @@ AGENT_ID="000"
 BIZ_SYSTEM="collection"
 DRY_RUN=false
 LIMIT=0
+FILE_PATTERN=("*" "")  # default: all known audio extensions
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
         --limit) LIMIT="$2"; shift 2 ;;
+        --format)
+            case "$2" in
+                awb|AWb|AWB) FILE_PATTERN=("*.awb"); shift 2 ;;
+                mp3|MP3)     FILE_PATTERN=("*.mp3"); shift 2 ;;
+                *) echo "Unknown format: $2 (use awb, mp3, or omit for all)"
+                   exit 1 ;;
+            esac
+            ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -37,97 +52,76 @@ echo "  业务: $BIZ_SYSTEM"
 echo "================================================="
 echo ""
 
-# Count total
-total_files=0
+# Collect all matching files
+all_files=()
+for ext in awb mp3; do
+    for f in "$CALLS_DIR"/*.$ext(N); do
+        all_files+=("$f")
+   	 done
+done
+
+total_files=${#all_files[@]}
+echo "共发现 $total_files 个录音文件"
+echo ""
+
 count=0
 success=0
 failed=0
 
-for f in "$CALLS_DIR"/*.awb(N); do
-    total_files=$((total_files + 1))
-done
-
-echo "共发现 $total_files 个录音文件"
-echo ""
-
-for f in "$CALLS_DIR"/*.awb(N); do
+for f in "${all_files[@]}"; do
     count=$((count + 1))
-    
-    # Extract filename without path and extension
-    filename=$(basename "$f" .awb)
-    
-    # Parse: {name}-{YYMMDDHHMM}[-N]
-    # Use zsh regex matching - get the base name and timestamp
-    # Timestamp: last group of 10 digits after a hyphen
-    if [[ "$filename" =~ ^(.+)-([0-9]{10})(-[0-9]+)?$ ]]; then
-        name="${match[1]}"
-        ts="${match[2]}"      # YYMMDDHHMM
-        seg="${match[3]}"     # Optional: -1, -2 (or empty)
-    else
-        echo "  [!] 跳过 (格式不匹配): $filename"
-        failed=$((failed + 1))
-        continue
-    fi
-    
-    # Convert YYMMDDHHMM → ISO 8601
-    YY="${ts:0:2}"
-    MM="${ts:2:2}"
-    DD="${ts:4:2}"
-    HH="${ts:6:2}"
-    MI="${ts:8:2}"
-    
-    # Assume YY = 20YY (years 2020-2029)
-    isoTimestamp="20${YY}-${MM}-${DD}T${HH}:${MI}:00"
-    
-    # Unique call_id = full filename (includes segment suffix if any)
-    call_id="$filename"
-    
-    # customer_phone = Chinese name (as customer ID)
-    customer_phone="$name"
-    
-    # Check if file is readable
+
+    filename=$(basename "$f")
+    ext="${filename##*.}"
+
+    # Check if file is readable and has content
     file_size=$(stat -f%z "$f" 2>/dev/null || echo "0")
     if [[ "$file_size" -lt 100 ]]; then
-        echo "  [!] 文件太小 ($file_size bytes): $(basename $f)"
+        echo "  [$count/$total_files] ⏭️ 文件太小 ($file_size bytes): $filename"
         failed=$((failed + 1))
         continue
     fi
-    
+
     if $DRY_RUN; then
-        echo "  [$count/$total_files] [DRY] $(basename $f)"
-        echo "        客户: $customer_phone | 时间: $isoTimestamp | call_id: $call_id"
+        # Show what the API would extract
+        name_part="${filename%.*}"
+        cust="${name_part%%-*}"
+        echo "  [$count/$total_files] [DRY] $filename"
+        echo "        客户ID: $cust | file: $f"
         continue
     fi
-    
-    # Progress indicator
-    echo -n "  [$count/$total_files] $(basename $f) ... "
-    
-    # Push via curl
+
+    # Progress
+    echo -n "  [$count/$total_files] $filename ... "
+
+    # Push via curl — API 自动从文件名提取 customer_phone / call_timestamp / call_id
     http_code=$(curl -s -o /tmp/push_resp_$$.json -w "%{http_code}" \
         -X POST "$API_URL" \
         -F "biz_system=$BIZ_SYSTEM" \
         -F "agent_id=$AGENT_ID" \
-        -F "customer_phone=$customer_phone" \
-        -F "call_timestamp=$isoTimestamp" \
-        -F "call_id=$call_id" \
         -F "audio_source_type=binary" \
         -F "audio_data=@$f" \
         -F "channel_separated=false" 2>/dev/null)
-    
+
     if [[ "$http_code" == "200" ]]; then
-        rec_id=$(python3 -c "import json; d=json.load(open('/tmp/push_resp_$$.json')); print(d.get('data',{}).get('recording_id','?'))" 2>/dev/null)
+        rec_id=$(python3 -c "
+import json, sys
+d=json.load(open('/tmp/push_resp_$$.json'))
+data=d.get('data',{})
+print(f\"{data.get('recording_id','?')} cust={data.get('customer_phone','?')} ts={data.get('call_timestamp','?')}\")" 2>/dev/null)
         echo "✅ id=$rec_id"
         success=$((success + 1))
     else
-        err_msg=$(python3 -c "import json; d=json.load(open('/tmp/push_resp_$$.json')); print(d.get('detail','unknown error'))" 2>/dev/null || echo "HTTP $http_code")
+        err_msg=$(python3 -c "
+import json, sys
+d=json.load(open('/tmp/push_resp_$$.json'))
+print(d.get('detail',''))" 2>/dev/null || echo "HTTP $http_code")
         echo "❌ HTTP=$http_code $err_msg"
         failed=$((failed + 1))
     fi
-    
-    # Cleanup temp file
+
     rm -f /tmp/push_resp_$$.json
-    
-    # Apply limit if set
+
     if [[ "$LIMIT" -gt 0 && "$count" -ge "$LIMIT" ]]; then
         echo ""
         echo "已达到 --limit $LIMIT，停止"

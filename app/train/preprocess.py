@@ -21,6 +21,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from train.db import (
     claim_pending_recordings,
@@ -30,6 +31,7 @@ from train.db import (
     recover_stuck_tasks,
     single_instance_lock,
     update_pre_status,
+    upsert_voiceprint,
 )
 from train.config import load_config
 from train.vad import preprocess_recording, get_output_paths
@@ -78,6 +80,32 @@ def parse_args() -> argparse.Namespace:
         "--config", type=str, default=None,
         help="配置文件路径",
     )
+    # ── Diarizer options ──
+    parser.add_argument(
+        "--diarize", action="store_true", default=True,
+        help="VAD 后运行说话人标注（默认打开）",
+    )
+    parser.add_argument(
+        "--no-diarize", action="store_true", default=False,
+        help="跳过说话人标注",
+    )
+    parser.add_argument(
+        "--diarizer-model", type=str, default="CAM++",
+        choices=["CAM++", "ResNet34", "ECAPA"],
+        help="声纹模型",
+    )
+    parser.add_argument(
+        "--diarizer-agent-threshold", type=float, default=None,
+        help="坐席判定阈值（默认 None=动态检测）",
+    )
+    parser.add_argument(
+        "--diarizer-cluster-threshold", type=float, default=0.55,
+        help="客户聚类阈值",
+    )
+    parser.add_argument(
+        "--cross-aggregate-only", action="store_true", default=False,
+        help="仅执行跨录音客户声纹聚合（跳过 VAD/diarize Phase 1）",
+    )
     return parser.parse_args()
 
 
@@ -86,9 +114,12 @@ def process_single(
     row: dict,
     preprocessed_root: str,
     vad_kwargs: dict,
+    diarizer_kwargs: Optional[dict] = None,
 ) -> int:
     """
     处理单条录音。
+    Args:
+        diarizer_kwargs: diarizer 参数（传给 preprocess_recording）。
     Returns: 0 成功, 1 失败。
     """
     rec_id = row["id"]
@@ -113,11 +144,13 @@ def process_single(
         )
 
         # Remove preprocessed results from output_dir key
-        result = preprocess_recording(
-            audio_path=audio_path,
-            output_dir=str(output_dir),
-            **vad_kwargs,
-        )
+        preprocess_kwargs = {"audio_path": audio_path, "output_dir": str(output_dir)}
+        preprocess_kwargs.update(vad_kwargs)
+        if diarizer_kwargs:
+            preprocess_kwargs.update(diarizer_kwargs)
+            # Don't double-pass run_diarization if vad_kwargs somehow has it
+            preprocess_kwargs.setdefault("run_diarization", True)
+        result = preprocess_recording(**preprocess_kwargs)
 
         update_pre_status(conn, rec_id, "done", pre_result=result)
         logger.info(
@@ -130,6 +163,144 @@ def process_single(
         logger.exception("预处理失败: id=%d call=%s", rec_id, call_id)
         update_pre_status(conn, rec_id, "failed", pre_error=str(e))
         return 1
+
+
+def _extract_customer_id(filename: str) -> str:
+    """从录音文件名提取客户 ID（第一个 '-' 前的部分）。
+
+    文件名格式:
+        客户名-YYMMDDHHMM         →  返回 "客户名"
+        客户名-YYMMDDHHMM-N       →  返回 "客户名"  (N为重复序号)
+        电话号码-YYMMDDHHMM       →  返回 "电话号码"
+    """
+    stem = Path(filename).stem if "." in filename else filename
+    # 从左切第一个 '-'，兼容 '顾子阳-2204232038-2' 这类多 '-' 文件名
+    parts = stem.split("-", 1)
+    if len(parts) == 2:
+        return parts[0]
+    return stem
+
+
+def _cross_call_aggregate_phase(
+    conn,
+    preprocessed_root: str,
+    diarizer_model: str = "CAM++",
+    diarizer_agent_threshold: Optional[float] = None,
+    diarizer_cluster_threshold: float = 0.55,
+) -> None:
+    """
+    Phase 2: 跨同客户多通录音聚合客户声纹。
+
+    思路：
+    1. 从 DB 读取所有 pre_status='done' 的录音
+    2. 按客户 ID（从 filename 提取）分组
+    3. 对每个客户的多通录音，重新扫描 preprocessed 目录找到 VAD 段文件
+    4. 对每通录音重新跑 diarizer（逐通标注）
+    5. 汇总同客户所有通的非坐席段 → 跨录音聚类 → centroid 入库
+
+    只处理有多通录音的客户或单通但有多个非坐席段的录音。
+    """
+    from train.diarizer import SpeakerDiarizer
+
+    # 查询所有已完成的录音
+    recs = conn.execute(
+        "SELECT id, customer_phone, call_id, biz_system, call_timestamp, pre_result "
+        "FROM recordings WHERE pre_status='done' ORDER BY call_id"
+    ).fetchall()
+    if not recs:
+        logger.info("跨录音聚合: 无已完成录音，跳过")
+        return
+
+    # 按客户 ID 分组（优先使用 customer_phone 字段，回退到 call_id 提取）
+    from collections import defaultdict
+    by_customer = defaultdict(list)
+    for r in recs:
+        cust_id = r["customer_phone"] or _extract_customer_id(r["call_id"])
+        by_customer[cust_id].append(dict(r))
+
+    logger.info("跨录音聚合: %d 位客户 / %d 通录音", len(by_customer), len(recs))
+
+    # 初始化 diarizer
+    diarizer = SpeakerDiarizer(
+        model_path=None,
+        model_name=diarizer_model,
+        agent_threshold=diarizer_agent_threshold,
+        cluster_threshold=diarizer_cluster_threshold,
+    )
+
+    # 构建 calls_by_customer 结构
+    calls_by_customer = {}
+    skipped = 0
+
+    for cust_id, rec_list in by_customer.items():
+        calls_info = []
+        for rec in rec_list:
+            # 定位 VAD 段文件目录
+            biz = rec["biz_system"] or "collection"
+            ts = rec["call_timestamp"] or ""
+            date_str = ts[:10] if ts else "unknown"
+            call_id = rec["call_id"]
+            seg_dir = Path(preprocessed_root) / biz / date_str / call_id
+            if not seg_dir.exists():
+                # 尝试其他日期目录
+                alt_dirs = list(Path(preprocessed_root).rglob(call_id))
+                if alt_dirs:
+                    seg_dir = alt_dirs[0]
+                else:
+                    skipped += 1
+                    continue
+
+            seg_files = sorted(seg_dir.glob("*_seg*.wav"))
+            if not seg_files:
+                skipped += 1
+                continue
+
+            calls_info.append({
+                "call_id": call_id,
+                "segment_files": seg_files,
+            })
+
+        if calls_info:
+            calls_by_customer[cust_id] = calls_info
+
+    if skipped:
+        logger.warning("跨录音聚合: 跳过 %d 通录音（段文件不存在）", skipped)
+
+    if not calls_by_customer:
+        logger.info("跨录音聚合: 无可处理的录音段")
+        return
+
+    # 对每通录音先跑一遍 diarize（逐通标注），收集结果
+    for cust_id, calls_info in calls_by_customer.items():
+        for call_info in calls_info:
+            results = diarizer.diarize(call_info["segment_files"])
+            call_info["diarize_results"] = results
+
+    # 跨录音聚合
+    aggregated = diarizer.cross_call_aggregate(calls_by_customer)
+
+    # 写入 DB
+    registered = 0
+    for agg in aggregated:
+        upsert_voiceprint(
+            conn,
+            model_name=diarizer_model,
+            speaker_type="customer",
+            speaker_id=agg["customer_id"],
+            embedding=agg["embedding"],
+            segment_count=agg["num_segments"],
+            source_call_ids=agg["source_call_ids"],
+        )
+        registered += 1
+        logger.info(
+            "已注册客户声纹: %s (%d 段 / %d 通录音)",
+            agg["customer_id"], agg["num_segments"], agg["num_calls"],
+        )
+
+    logger.info(
+        "跨录音聚合完成: %d 位客户 → 注册 %d 条客户声纹",
+        len(calls_by_customer), registered,
+    )
 
 
 def main() -> None:
@@ -170,7 +341,13 @@ def main() -> None:
         if not row:
             logger.error("未找到 call_id=%s", args.call_id)
             sys.exit(1)
-        process_single(conn, row, cfg["preprocessed_root"], pre_cfg)
+        diarizer_kwargs = {
+            "run_diarization": not args.no_diarize,
+            "diarizer_model_name": args.diarizer_model,
+            "diarizer_agent_threshold": args.diarizer_agent_threshold,
+            "diarizer_cluster_threshold": args.diarizer_cluster_threshold,
+        }
+        process_single(conn, row, cfg["preprocessed_root"], pre_cfg, diarizer_kwargs)
         conn.close()
         return
 
@@ -187,6 +364,14 @@ def main() -> None:
         "apply_noise_reduction": True,
     }
 
+    # Diarizer kwargs from CLI args
+    diarizer_kwargs = {
+        "run_diarization": not args.no_diarize,
+        "diarizer_model_name": args.diarizer_model,
+        "diarizer_agent_threshold": args.diarizer_agent_threshold,
+        "diarizer_cluster_threshold": args.diarizer_cluster_threshold,
+    }
+
     # Watch mode: loop forever
     if args.watch:
         logger.info("进入 WATCH 模式，每 60 秒轮询...")
@@ -198,13 +383,36 @@ def main() -> None:
                 continue
 
             for row in rows:
-                process_single(conn, row, cfg["preprocessed_root"], vad_kwargs)
+                process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs)
+
+            # Phase 2: 跨录音聚合（每批处理完后触发）
+            if not args.no_diarize:
+                _cross_call_aggregate_phase(
+                    conn=conn,
+                    preprocessed_root=cfg["preprocessed_root"],
+                    diarizer_model=args.diarizer_model,
+                    diarizer_agent_threshold=args.diarizer_agent_threshold,
+                    diarizer_cluster_threshold=args.diarizer_cluster_threshold,
+                )
 
             # Reconnect to refresh stats
             conn.close()
             conn = get_connection(db_path)
             init_db(conn)
 
+        return
+
+    # Cross-aggregate-only mode: 跳过 Phase 1，直接跑 Phase 2
+    if args.cross_aggregate_only:
+        logger.info("仅执行跨录音聚合模式（跳过 VAD/diarize）")
+        _cross_call_aggregate_phase(
+            conn=conn,
+            preprocessed_root=cfg["preprocessed_root"],
+            diarizer_model=args.diarizer_model,
+            diarizer_agent_threshold=args.diarizer_agent_threshold,
+            diarizer_cluster_threshold=args.diarizer_cluster_threshold,
+        )
+        conn.close()
         return
 
     # One-shot mode
@@ -214,13 +422,24 @@ def main() -> None:
     success = 0
     failed = 0
     for row in rows:
-        rc = process_single(conn, row, cfg["preprocessed_root"], vad_kwargs)
+        rc = process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs)
         if rc == 0:
             success += 1
         else:
             failed += 1
 
     logger.info("预处理完成: 成功=%d 失败=%d", success, failed)
+
+    # ── Phase 2: 跨同客户多通录音聚合客户声纹 ──
+    if success > 0 and not args.no_diarize:
+        _cross_call_aggregate_phase(
+            conn=conn,
+            preprocessed_root=cfg["preprocessed_root"],
+            diarizer_model=args.diarizer_model,
+            diarizer_agent_threshold=args.diarizer_agent_threshold,
+            diarizer_cluster_threshold=args.diarizer_cluster_threshold,
+        )
+
     conn.close()
 
 
