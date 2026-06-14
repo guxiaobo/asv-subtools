@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>坐席工作台 - ASV 声纹识别系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f1f5f9; min-height: 100vh; }
+        .navbar { background: #1e3a5f; color: white; padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+        .navbar h2 { font-size: 18px; }
+        .user-info { font-size: 13px; color: #94a3b8; }
+        .user-info strong { color: white; }
+        .nav-links a { color: #94a3b8; text-decoration: none; margin-left: 20px; font-size: 14px; }
+        .nav-links a:hover { color: white; }
+        .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card h3 { font-size: 18px; color: #1e293b; margin-bottom: 16px; }
+        .upload-zone { border: 2px dashed #d1d5db; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; }
+        .upload-zone:hover, .upload-zone.dragover { border-color: #3b82f6; background: #f0f7ff; }
+        .upload-zone .icon { font-size: 48px; color: #94a3b8; }
+        .upload-zone p { color: #64748b; margin-top: 8px; font-size: 14px; }
+        .file-info { display: none; margin-top: 16px; padding: 16px; background: #f8fafc; border-radius: 8px; text-align: left; }
+        .file-info .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+        .file-info .label { color: #64748b; }
+        .file-info .value { color: #1e293b; font-weight: 500; }
+        .btn { padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1e40af; color: white; }
+        .btn-primary:hover { background: #1e3a8a; }
+        .btn-primary:disabled { background: #94a3b8; cursor: not-allowed; }
+        .progress-bar { display: none; margin-top: 16px; height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
+        .progress-bar .fill { height: 100%; background: #3b82f6; width: 0%; transition: width 0.3s; }
+        .msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+        .msg.success { background: #f0fdf4; color: #16a34a; }
+        .msg.error { background: #fef2f2; color: #dc2626; }
+        .msg.info { background: #eff6ff; color: #1d4ed8; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f8fafc; color: #64748b; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+        .badge-raw { background: #fef3c7; color: #92400e; }
+        .badge-preprocessed { background: #dbeafe; color: #1d4ed8; }
+        .badge-training { background: #ede9fe; color: #6d28d9; }
+        .badge-done { background: #dcfce7; color: #15803d; }
+        .badge-error { background: #fef2f2; color: #dc2626; }
+        .badge-pending { background: #f1f5f9; color: #64748b; }
+        .empty { text-align: center; padding: 40px; color: #94a3b8; font-size: 14px; }
+        @media (max-width: 640px) {
+            table { font-size: 12px; }
+            th, td { padding: 6px 8px; }
+        }
+    </style>
+</head>
+<body>
+<div class="navbar">
+    <h2>🔊 ASV 声纹识别系统</h2>
+    <div class="user-info">坐席：<strong>{{ user.get('agent_id','') }}</strong>（{{ user.get('sub','') }}）</div>
+    <div class="nav-links">
+        <a href="/agent">首页</a>
+        <a href="/change-password">修改密码</a>
+        <a href="/logout">注销</a>
+    </div>
+</div>
+<div class="container">
+    {% if error %}
+    <div class="msg error">{{ error }}</div>
+    {% endif %}
+    {% if ok %}
+    <div class="msg success">{{ ok }}</div>
+    {% endif %}
+
+    <div class="card">
+        <h3>📤 上传录音</h3>
+        <div id="flashMsg"></div>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                <div class="icon">🎤</div>
+                <p><strong>点击选择</strong> 或拖拽录音文件到此处</p>
+                <p style="font-size:12px;color:#9ca3af;margin-top:4px;">支持 .wav .mp3 .ulaw .alaw，文件名格式：{客户标识}-{YYMMDDHHMM} 或 {坐席ID}-{客户标识}-{YYMMDDHHMM}</p>
+            </div>
+            <input type="file" id="fileInput" accept=".wav,.mp3,.ulaw,.alaw" style="display:none" onchange="onFileSelect(event)">
+            <div id="fileInfo" class="file-info"></div>
+            <div class="progress-bar" id="progressBar"><div class="fill" id="progressFill"></div></div>
+            <button type="submit" id="uploadBtn" class="btn btn-primary" style="margin-top:16px;" disabled onclick="uploadFile(event)">上传录音</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>📋 我的录音（最近50条）</h3>
+        {% if recordings %}
+        <div style="overflow-x:auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>客户</th>
+                    <th>通话时间</th>
+                    <th>时长(s)</th>
+                    <th>状态</th>
+                    <th>预处理</th>
+                    <th>训练</th>
+                    <th>上传时间</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in recordings %}
+                <tr>
+                    <td>{{ r.id }}</td>
+                    <td>{{ r.customer_phone }}</td>
+                    <td>{{ r.call_timestamp[:16] if r.call_timestamp else '-' }}</td>
+                    <td>{{ '%.1f'|format(r.duration_sec) if r.duration_sec else '-' }}</td>
+                    <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+                    <td><span class="badge badge-{{ r.pre_status or 'pending' }}">{{ r.pre_status or 'pending' }}</span></td>
+                    <td><span class="badge badge-{{ r.train_status or 'pending' }}">{{ r.train_status or 'pending' }}</span></td>
+                    <td>{{ r.created_at[:16] if r.created_at else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        {% else %}
+        <div class="empty">暂无录音记录，请先上传</div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+let selectedFile = null;
+
+function onFileSelect(event) {
+    selectedFile = event.target.files[0];
+    if (!selectedFile) return;
+    showFileInfo(selectedFile);
+}
+
+// Drag and drop
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) { selectedFile = file; showFileInfo(file); }
+});
+
+function showFileInfo(file) {
+    const validExts = ['.wav', '.mp3', '.ulaw', '.alaw'];
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    if (!validExts.includes(ext)) {
+        flashMsg('不支持的文件格式：' + ext, 'error');
+        document.getElementById('uploadBtn').disabled = true;
+        return;
+    }
+
+    // Parse filename
+    const nameNoExt = file.name.replace(/\.[^.]+$/, '');
+    const parts = nameNoExt.split('-');
+    let fileInfo = '';
+    let valid = true;
+    let parseError = '';
+
+    if (parts.length < 2) {
+        parseError = '文件名格式错误：应包含客户标识和时间戳，用"-"分隔';
+        valid = false;
+    } else if (parts.length === 2) {
+        const ts = parts[1];
+        if (!/^\d{10}$/.test(ts)) { parseError = '时间戳格式错误，应为YYMMDDHHMM（10位数字）'; valid = false; }
+        else {
+            const hh = parseInt(ts.slice(4,6)), mm = parseInt(ts.slice(6,8));
+            if (hh > 23 || mm > 59) { parseError = '时间戳中的时间超出范围'; valid = false; }
+        }
+        if (valid) fileInfo = `<div class="row"><span class="label">格式</span><span class="value">${parts.length}段式（客户-时间戳）</span></div>`;
+    } else if (parts.length === 3) {
+        const ts = parts[2];
+        if (!/^\d{10}$/.test(ts)) { parseError = '时间戳格式错误'; valid = false; }
+        else {
+            const hh = parseInt(ts.slice(4,6)), mm = parseInt(ts.slice(6,8));
+            if (hh > 23 || mm > 59) { parseError = '时间戳中的时间超出范围'; valid = false; }
+        }
+        if (valid) fileInfo = `<div class="row"><span class="label">格式</span><span class="value">${parts.length}段式（坐席ID-客户-时间戳）</span></div>`;
+    } else {
+        parseError = '文件名格式错误：最多支持3段（坐席ID-客户-时间戳）';
+        valid = false;
+    }
+
+    if (!valid) {
+        flashMsg(parseError, 'error');
+        document.getElementById('uploadBtn').disabled = true;
+        document.getElementById('fileInfo').style.display = 'none';
+        return;
+    }
+
+    fileInfo += `<div class="row"><span class="label">文件</span><span class="value">${file.name}</span></div>`;
+    fileInfo += `<div class="row"><span class="label">大小</span><span class="value">${(file.size / 1024).toFixed(1)} KB</span></div>`;
+
+    if (file.size <= 1024) {
+        flashMsg('文件太小（≤1KB），请确认录音有效', 'error');
+        document.getElementById('uploadBtn').disabled = true;
+        document.getElementById('fileInfo').innerHTML = fileInfo;
+        document.getElementById('fileInfo').style.display = 'block';
+        return;
+    }
+
+    document.getElementById('fileInfo').innerHTML = fileInfo;
+    document.getElementById('fileInfo').style.display = 'block';
+    document.getElementById('uploadBtn').disabled = false;
+}
+
+async function uploadFile(event) {
+    event.preventDefault();
+    if (!selectedFile) return;
+
+    const btn = document.getElementById('uploadBtn');
+    const progress = document.getElementById('progressBar');
+    const fill = document.getElementById('progressFill');
+    btn.disabled = true;
+    progress.style.display = 'block';
+    fill.style.width = '30%';
+
+    const formData = new FormData();
+    formData.append('agent_id', '');  // 通过文件名自动解析
+    formData.append('biz_system', 'agent_upload');
+    formData.append('audio_data', selectedFile);
+
+    try {
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
+        fill.style.width = '80%';
+        const result = await resp.json();
+
+        if (result.success) {
+            fill.style.width = '100%';
+            setTimeout(() => {
+                flashMsg('上传成功！录音ID: ' + result.recording_id, 'success');
+                setTimeout(() => location.reload(), 1500);
+            }, 500);
+        } else {
+            flashMsg('上传失败：' + (result.error?.message || JSON.stringify(result.error)), 'error');
+            btn.disabled = false;
+            progress.style.display = 'none';
+        }
+    } catch (e) {
+        flashMsg('网络错误：' + e.message, 'error');
+        btn.disabled = false;
+        progress.style.display = 'none';
+    }
+}
+
+function flashMsg(text, type) {
+    const el = document.getElementById('flashMsg');
+    el.innerHTML = `<div class="msg ${type}">${text}</div>`;
+    setTimeout(() => el.innerHTML='', 5000);
+}
+</script>
+</body>
+</html>

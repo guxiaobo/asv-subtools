@@ -547,8 +547,11 @@ def get_agent_voiceprint(
 
 
 # ---------------------------------------------------------------------------
-# Single-instance lock (fcntl-based, POSIX)
+# Single-instance lock (cross-platform via O_CREAT|O_EXCL)
 # ---------------------------------------------------------------------------
+# 使用 os.open() + O_EXCL 原子创建 lock 文件，
+# 不需要 fcntl（Linux/macOS 专用），在 Windows 上同样可用。
+# 进程退出时 lock 文件自动清理（atexit）。
 
 _FILE_LOCKS: Dict[str, int] = {}
 
@@ -556,30 +559,33 @@ _FILE_LOCKS: Dict[str, int] = {}
 def single_instance_lock(name: str) -> bool:
     """
     防止同一模块启动多个实例。
-    使用 fcntl 文件锁，进程退出时自动释放。
+
+    使用 os.open() + O_CREAT|O_EXCL 原子创建 lock 文件。
+    跨平台兼容（macOS / Windows / Linux）。
 
     Returns:
         True 如果成功获得锁，False 如果另一个实例已在运行。
     """
     import atexit
-    import fcntl
+    import os
+    import tempfile
 
-    lock_path = Path(f"/tmp/asv_train_{name}.lock")
+    lock_path = Path(tempfile.gettempdir()) / f"asv_train_{name}.lock"
     try:
-        fd = lock_path.open("w")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except (FileExistsError, PermissionError, OSError):
         logger.error("另一个 %s 进程已在运行 (lock: %s)", name, lock_path)
         return False
 
-    _FILE_LOCKS[name] = fd
+    _FILE_LOCKS[name] = 1  # marker
 
     @atexit.register
     def _release():
         if name in _FILE_LOCKS:
             try:
-                fcntl.flock(_FILE_LOCKS[name], fcntl.LOCK_UN)
-                _FILE_LOCKS[name].close()
+                lock_path.unlink(missing_ok=True)
             except Exception:
                 pass
             del _FILE_LOCKS[name]

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统管理 - ASV 声纹识别系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f1f5f9; min-height: 100vh; }
+        .navbar { background: #1e3a5f; color: white; padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+        .navbar h2 { font-size: 18px; }
+        .nav-links a { color: #94a3b8; text-decoration: none; margin-left: 20px; font-size: 14px; }
+        .nav-links a:hover { color: white; }
+        .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card h3 { font-size: 18px; color: #1e293b; margin-bottom: 16px; }
+        .flex-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .form-group { margin-bottom: 12px; }
+        label { display: block; font-size: 13px; color: #374151; margin-bottom: 4px; font-weight: 500; }
+        input, select { width: 100%; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; outline: none; }
+        input:focus, select:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+        .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+        .btn-primary { background: #1e40af; color: white; }
+        .btn-primary:hover { background: #1e3a8a; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover { background: #b91c1c; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-success:hover { background: #15803d; }
+        .btn-warning { background: #d97706; color: white; margin-right: 6px; }
+        .btn-warning:hover { background: #b45309; }
+        .btn-secondary { background: #64748b; color: white; }
+        .btn-secondary:hover { background: #475569; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px 12px; text-align: left; font-size: 14px; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f8fafc; color: #64748b; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
+        .badge-admin { background: #ede9fe; color: #6d28d9; }
+        .badge-model_manager { background: #dbeafe; color: #1d4ed8; }
+        .badge-agent { background: #d1fae5; color: #047857; }
+        .badge-enabled { background: #dcfce7; color: #15803d; }
+        .badge-disabled { background: #fef2f2; color: #dc2626; }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal { background: white; border-radius: 12px; padding: 32px; width: 420px; max-width: 90vw; box-shadow: 0 25px 50px rgba(0,0,0,0.2); }
+        .msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+        .msg.success { background: #f0fdf4; color: #16a34a; }
+        .msg.error { background: #fef2f2; color: #dc2626; }
+    </style>
+</head>
+<body>
+<div class="navbar">
+    <h2>🔊 ASV 声纹识别系统 - 系统管理</h2>
+    <div class="nav-links">
+        <a href="/admin">用户管理</a>
+        <a href="/change-password">修改密码</a>
+        <a href="/logout">注销</a>
+    </div>
+</div>
+<div class="container">
+    <div id="flashMsg"></div>
+
+    <div class="card">
+        <div class="flex-row">
+            <h3>用户列表</h3>
+            <button class="btn btn-primary" onclick="showCreateModal()">+ 创建用户</button>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>用户名</th>
+                    <th>显示名</th>
+                    <th>角色</th>
+                    <th>坐席ID</th>
+                    <th>状态</th>
+                    <th>创建时间</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                <tr>
+                    <td>{{ u.id }}</td>
+                    <td><strong>{{ u.username }}</strong></td>
+                    <td>{{ u.display_name or '-' }}</td>
+                    <td><span class="badge badge-{{ u.role }}">{{ roles.get(u.role, u.role) }}</span></td>
+                    <td>{{ u.agent_id or '-' }}</td>
+                    <td>
+                        {% if u.enabled %}
+                        <span class="badge badge-enabled">正常</span>
+                        {% else %}
+                        <span class="badge badge-disabled">禁用</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ u.created_at[:10] if u.created_at else '-' }}</td>
+                    <td>
+                        <button class="btn btn-sm btn-warning" onclick="toggleUser({{ u.id }})">
+                            {% if u.enabled %}禁用{% else %}启用{% endif %}
+                        </button>
+                        <button class="btn btn-sm btn-danger" onclick="showResetPwdModal({{ u.id }}, '{{ u.username }}')">
+                            重置密码
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 创建用户弹窗 -->
+<div id="createModal" class="modal-overlay">
+    <div class="modal">
+        <h3>创建用户</h3>
+        <div id="createError" class="msg error" style="display:none"></div>
+        <div class="form-group">
+            <label>用户名</label>
+            <input type="text" id="newUsername" required>
+        </div>
+        <div class="form-group">
+            <label>密码（至少6位）</label>
+            <input type="password" id="newPassword" required>
+        </div>
+        <div class="form-group">
+            <label>角色</label>
+            <select id="newRole">
+                <option value="admin">系统管理员</option>
+                <option value="model_manager">模型管理员</option>
+                <option value="agent" selected>坐席</option>
+            </select>
+        </div>
+        <div class="form-group" id="agentIdGroup">
+            <label>坐席ID</label>
+            <input type="text" id="newAgentId" placeholder="坐席的唯一工号">
+        </div>
+        <div class="form-group">
+            <label>显示名（可选）</label>
+            <input type="text" id="newDisplayName" placeholder="用户显示名称">
+        </div>
+        <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:16px;">
+            <button class="btn btn-secondary" onclick="hideCreateModal()">取消</button>
+            <button class="btn btn-primary" onclick="createUser()">创建</button>
+        </div>
+    </div>
+</div>
+
+<!-- 重置密码弹窗 -->
+<div id="resetPwdModal" class="modal-overlay">
+    <div class="modal">
+        <h3>重置密码</h3>
+        <p style="color:#64748b;font-size:14px;margin-bottom:16px;">用户：<strong id="resetUsername"></strong></p>
+        <div id="resetPwdError" class="msg error" style="display:none"></div>
+        <div class="form-group">
+            <label>新密码（至少6位）</label>
+            <input type="password" id="resetNewPassword" required>
+        </div>
+        <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:16px;">
+            <button class="btn btn-secondary" onclick="hideResetPwdModal()">取消</button>
+            <button class="btn btn-danger" onclick="resetPassword()">确认重置</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let resetTargetUserId = null;
+
+document.getElementById('newRole').addEventListener('change', function() {
+    document.getElementById('agentIdGroup').style.display = this.value === 'agent' ? 'block' : 'none';
+});
+document.getElementById('newRole').dispatchEvent(new Event('change'));
+
+function showCreateModal() { document.getElementById('createModal').classList.add('active'); }
+function hideCreateModal() { document.getElementById('createModal').classList.remove('active'); document.getElementById('createError').style.display='none'; }
+function showResetPwdModal(uid, uname) { resetTargetUserId=uid; document.getElementById('resetUsername').textContent=uname; document.getElementById('resetPwdModal').classList.add('active'); }
+function hideResetPwdModal() { resetTargetUserId=null; document.getElementById('resetPwdModal').classList.remove('active'); document.getElementById('resetPwdError').style.display='none'; }
+
+function flashMsg(text, type) {
+    const el = document.getElementById('flashMsg');
+    el.innerHTML = `<div class="msg ${type}">${text}</div>`;
+    setTimeout(() => el.innerHTML='', 4000);
+}
+
+async function createUser() {
+    const data = new FormData();
+    data.append('username', document.getElementById('newUsername').value);
+    data.append('password', document.getElementById('newPassword').value);
+    data.append('role', document.getElementById('newRole').value);
+    data.append('agent_id', document.getElementById('newAgentId').value);
+    data.append('display_name', document.getElementById('newDisplayName').value);
+
+    try {
+        const resp = await fetch('/admin/user/create', { method:'POST', body:data });
+        const result = await resp.json();
+        if (result.success) {
+            flashMsg('用户创建成功', 'success');
+            hideCreateModal();
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            document.getElementById('createError').textContent = result.error;
+            document.getElementById('createError').style.display = 'block';
+        }
+    } catch(e) {
+        document.getElementById('createError').textContent = '网络错误';
+        document.getElementById('createError').style.display = 'block';
+    }
+}
+
+async function toggleUser(uid) {
+    const data = new FormData();
+    data.append('user_id', uid);
+    try {
+        const resp = await fetch('/admin/user/toggle', { method:'POST', body:data });
+        const result = await resp.json();
+        if (result.success) {
+            flashMsg('用户状态已更新', 'success');
+            location.reload();
+        } else {
+            flashMsg(result.error || '操作失败', 'error');
+        }
+    } catch(e) {
+        flashMsg('网络错误', 'error');
+    }
+}
+
+async function resetPassword() {
+    const pwd = document.getElementById('resetNewPassword').value;
+    if (!pwd || pwd.length < 6) { document.getElementById('resetPwdError').textContent='密码至少6位'; document.getElementById('resetPwdError').style.display='block'; return; }
+    const data = new FormData();
+    data.append('user_id', resetTargetUserId);
+    data.append('new_password', pwd);
+    try {
+        const resp = await fetch('/admin/user/reset-password', { method:'POST', body:data });
+        const result = await resp.json();
+        if (result.success) {
+            flashMsg('密码已重置', 'success');
+            hideResetPwdModal();
+        } else {
+            document.getElementById('resetPwdError').textContent = result.error;
+            document.getElementById('resetPwdError').style.display = 'block';
+        }
+    } catch(e) {
+        document.getElementById('resetPwdError').textContent = '网络错误';
+        document.getElementById('resetPwdError').style.display = 'block';
+    }
+}
+</script>
+</body>
+</html>

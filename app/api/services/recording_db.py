@@ -114,6 +114,19 @@ async def init_db(db_path: Optional[str] = None) -> None:
             )
         """)
 
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS speaker_voiceprints (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name      TEXT    NOT NULL,
+                speaker_type    TEXT    NOT NULL,
+                speaker_id      TEXT    NOT NULL,
+                embedding       BLOB    NOT NULL,
+                segment_count   INTEGER DEFAULT 1,
+                source_call_ids TEXT,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+
         for idx_stmt in [
             "CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status)",
             "CREATE INDEX IF NOT EXISTS idx_recordings_pre_status ON recordings(pre_status)",
@@ -125,6 +138,22 @@ async def init_db(db_path: Optional[str] = None) -> None:
                 await conn.execute(idx_stmt)
             except Exception:
                 pass
+
+        # ── Users table (auth) ────────────────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                username        TEXT    NOT NULL UNIQUE,
+                password_hash   TEXT    NOT NULL,
+                role            TEXT    NOT NULL DEFAULT 'agent'
+                                        CHECK (role IN ('admin','model_manager','agent')),
+                agent_id        TEXT    NOT NULL DEFAULT '',
+                display_name    TEXT    NOT NULL DEFAULT '',
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
 
         await conn.commit()
 
@@ -290,5 +319,257 @@ async def count_pending_train(db_path: Optional[str] = None) -> int:
         )
         row = await cursor.fetchone()
         return row["cnt"]
+    finally:
+        await conn.close()
+
+
+async def list_recordings(
+    *,
+    agent_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    order_by: str = "id DESC",
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    查询录音列表。支持按坐席 ID、状态筛选。
+
+    Args:
+        agent_id: 筛选该坐席的录音，None=所有
+        status: 筛选状态，None=所有
+        limit: 返回条数
+        offset: 偏移
+        order_by: 排序字段
+        db_path: 数据库路径
+    Returns: 录音记录列表
+    """
+    conn = await _open_conn(db_path)
+    try:
+        where_clauses = []
+        params = []
+
+        if agent_id:
+            where_clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if status:
+            where_clauses.append("status = ?")
+            params.append(status)
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        cursor = await conn.execute(
+            f"SELECT * FROM recordings{where_sql} ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+async def update_recording_status(
+    call_id: str,
+    *,
+    status: Optional[str] = None,
+    pre_status: Optional[str] = None,
+    train_status: Optional[str] = None,
+    pre_result: Optional[str] = None,
+    pre_error: Optional[str] = None,
+    train_result: Optional[str] = None,
+    train_error: Optional[str] = None,
+    model_version: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> bool:
+    """更新录音记录的状态字段。"""
+    conn = await _open_conn(db_path)
+    try:
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        updates = ["updated_at = ?"]
+        params = [now]
+
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if pre_status is not None:
+            updates.append("pre_status = ?")
+            params.append(pre_status)
+        if train_status is not None:
+            updates.append("train_status = ?")
+            params.append(train_status)
+        if pre_result is not None:
+            updates.append("pre_result = ?")
+            params.append(pre_result)
+        if pre_error is not None:
+            updates.append("pre_error = ?")
+            params.append(pre_error)
+        if train_result is not None:
+            updates.append("train_result = ?")
+            params.append(train_result)
+        if train_error is not None:
+            updates.append("train_error = ?")
+            params.append(train_error)
+        if model_version is not None:
+            updates.append("model_version = ?")
+            params.append(model_version)
+        if status is not None and status in ("preprocessed", "error"):
+            updates.append("pre_finished_at = ?")
+            params.append(now)
+        if train_status is not None and train_status in ("done", "error"):
+            updates.append("train_finished_at = ?")
+            params.append(now)
+
+        params.append(call_id)
+        await conn.execute(
+            f"UPDATE recordings SET {', '.join(updates)} WHERE call_id = ?", params
+        )
+        await conn.commit()
+        return True
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# User CRUD
+# ---------------------------------------------------------------------------
+
+
+async def get_user_by_username(
+    username: str, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """通过用户名查询用户。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def get_user_by_id(
+    user_id: int, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """通过 ID 查询用户。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def list_users(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """列出所有用户。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT id, username, role, agent_id, display_name, enabled, "
+            "created_at, updated_at FROM users ORDER BY id ASC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+async def create_user(
+    *,
+    username: str,
+    password_hash: str,
+    role: str,
+    agent_id: str = "",
+    display_name: str = "",
+    enabled: bool = True,
+    db_path: Optional[str] = None,
+) -> int:
+    """
+    创建用户。
+
+    Returns: 用户 ID.
+    Raises: ValueError if username already exists.
+    """
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "INSERT INTO users (username, password_hash, role, agent_id, display_name, enabled) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (username, password_hash, role, agent_id, display_name, 1 if enabled else 0),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            raise ValueError(f"用户名 '{username}' 已存在")
+        raise
+    finally:
+        await conn.close()
+
+
+async def update_user(
+    user_id: int,
+    *,
+    password_hash: Optional[str] = None,
+    role: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    display_name: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    db_path: Optional[str] = None,
+) -> bool:
+    """更新用户信息。"""
+    conn = await _open_conn(db_path)
+    try:
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        updates = ["updated_at = ?"]
+        params = [now]
+
+        if password_hash is not None:
+            updates.append("password_hash = ?")
+            params.append(password_hash)
+        if role is not None:
+            updates.append("role = ?")
+            params.append(role)
+        if agent_id is not None:
+            updates.append("agent_id = ?")
+            params.append(agent_id)
+        if display_name is not None:
+            updates.append("display_name = ?")
+            params.append(display_name)
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(1 if enabled else 0)
+
+        params.append(user_id)
+        await conn.execute(
+            f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params
+        )
+        await conn.commit()
+        return True
+    finally:
+        await conn.close()
+
+
+async def get_users_by_role(
+    role: str, db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """按角色查询用户列表。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT id, username, agent_id, display_name FROM users "
+            "WHERE role = ? AND enabled = 1 ORDER BY id ASC",
+            (role,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
     finally:
         await conn.close()

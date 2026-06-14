@@ -32,7 +32,9 @@ from config import AppConfig, dump_config, load_config
 from onnx_model import ONNXModel
 from routers import health as health_router
 from routers import recordings as recordings_router
+from routers import upload_web as upload_web_router
 from routers import verify as verify_router
+from routers import auth_router as auth_router_mod
 from services.audio import AudioLoader, AudioLoadError, InsufficientAudioError
 from services.cache import create_cache
 from services.fetcher import AudioFetcher
@@ -133,6 +135,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning("Training DB init failed: %s — recordings push will be unavailable", e)
 
+    # 8. Ensure default admin user
+    try:
+        await auth_router_mod.ensure_default_admin()
+    except Exception as e:
+        logger.warning("Default admin setup failed: %s", e)
+
     logger.info(
         "ASV API ready in %.2fs | %s | threshold=%.3f",
         time.time() - startup_time,
@@ -183,6 +191,8 @@ app.add_middleware(
 app.include_router(health_router.router)
 app.include_router(verify_router.router)
 app.include_router(recordings_router.router)
+app.include_router(upload_web_router.router)
+app.include_router(auth_router_mod.router)  # 登录/用户管理/角色页面
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-
+from typing import Dict, List, Optional, Tuple
 from train.db import (
     claim_pending_recordings,
     count_pending_train,
@@ -177,7 +177,8 @@ def main() -> None:
 
     # ──── STEP 3: Evaluate ──────────────────────────────────────────────────
     api_models_dir = model_cfg.get("api_models_dir", "")
-    tmp_checkpoint = "/tmp/asv_incremental_checkpoint.pt"
+    import tempfile
+    tmp_checkpoint = str(Path(tempfile.gettempdir()) / "asv_incremental_checkpoint.pt")
     trainer.save_checkpoint(tmp_checkpoint)
 
     eval_result = evaluate_on_test_set(

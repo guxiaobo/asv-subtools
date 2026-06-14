@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>坐席录音上传</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f0f2f5;
+            color: #333;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 680px;
+            width: 100%;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 28px;
+        }
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            padding: 32px;
+            margin-bottom: 20px;
+        }
+        .card h2 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #1a1a1a;
+        }
+
+        /* === Form === */
+        .form-row {
+            margin-bottom: 18px;
+        }
+        .form-row label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 5px;
+            color: #444;
+        }
+        .form-row label .hint {
+            font-weight: 400;
+            color: #888;
+            font-size: 12px;
+        }
+        .form-row input[type="text"],
+        .form-row select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #d9d9d9;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        .form-row input[type="text"]:focus,
+        .form-row select:focus {
+            outline: none;
+            border-color: #1890ff;
+            box-shadow: 0 0 0 2px rgba(24,144,255,0.15);
+        }
+        .form-row input[type="text"]:disabled {
+            background: #f5f5f5;
+            color: #333;
+            cursor: not-allowed;
+        }
+        .form-row .field-note {
+            font-size: 12px;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        /* === File dropzone === */
+        .dropzone {
+            border: 2px dashed #d9d9d9;
+            border-radius: 8px;
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        .dropzone:hover,
+        .dropzone.dragover {
+            border-color: #1890ff;
+            background: #f0f8ff;
+        }
+        .dropzone .icon {
+            font-size: 36px;
+            margin-bottom: 8px;
+        }
+        .dropzone .text {
+            font-size: 14px;
+            color: #666;
+        }
+        .dropzone .text strong {
+            color: #1890ff;
+        }
+        .dropzone .ext-hint {
+            font-size: 12px;
+            color: #999;
+            margin-top: 6px;
+        }
+        .dropzone.has-file {
+            border-style: solid;
+            border-color: #52c41a;
+            background: #f6ffed;
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .dropzone.has-file .file-info {
+            text-align: left;
+            flex: 1;
+        }
+        .dropzone.has-file .file-info .name {
+            font-weight: 500;
+            font-size: 14px;
+        }
+        .dropzone.has-file .file-info .meta {
+            font-size: 12px;
+            color: #888;
+            margin-top: 2px;
+        }
+        .dropzone.has-file .remove-btn {
+            background: none;
+            border: none;
+            color: #ff4d4f;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        .dropzone.has-file .remove-btn:hover {
+            background: #fff2f0;
+        }
+        .dropzone input[type="file"] { display: none; }
+        .validation-msg {
+            font-size: 13px;
+            margin-top: 6px;
+            min-height: 20px;
+        }
+        .validation-msg.error { color: #ff4d4f; }
+        .validation-msg.ok { color: #52c41a; }
+        .validation-msg.info { color: #1890ff; }
+
+        /* === Submit === */
+        .submit-area {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+        }
+        .btn {
+            flex: 1;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary {
+            background: #1890ff;
+            color: #fff;
+        }
+        .btn-primary:hover:not(:disabled) { background: #40a9ff; }
+        .btn-secondary {
+            background: #f0f0f0;
+            color: #333;
+        }
+        .btn-secondary:hover:not(:disabled) { background: #d9d9d9; }
+
+        /* === Progress === */
+        .progress-wrap {
+            display: none;
+            margin-top: 16px;
+        }
+        .progress-wrap.active { display: block; }
+        .progress-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #1890ff, #52c41a);
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .progress-text {
+            font-size: 13px;
+            color: #666;
+            margin-top: 6px;
+            text-align: center;
+        }
+
+        /* === Result === */
+        .result {
+            display: none;
+            padding: 16px 20px;
+            border-radius: 8px;
+            margin-top: 16px;
+            font-size: 14px;
+        }
+        .result.active { display: block; }
+        .result.success {
+            background: #f6ffed;
+            border: 1px solid #b7eb8f;
+            color: #135200;
+        }
+        .result.error {
+            background: #fff2f0;
+            border: 1px solid #ffccc7;
+            color: #820014;
+        }
+        .result .detail { margin-top: 8px; font-size: 13px; }
+        .result .detail table { width: 100%; border-collapse: collapse; }
+        .result .detail td { padding: 4px 8px; border-bottom: 1px solid #e8e8e8; }
+        .result .detail td:first-child { color: #888; width: 110px; }
+
+        /* === History === */
+        .history-list {
+            margin-top: 12px;
+        }
+        .history-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 13px;
+        }
+        .history-item:last-child { border-bottom: none; }
+        .history-item .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .status-badge.raw { background: #e6f7ff; color: #003a8c; }
+        .status-badge.error { background: #fff2f0; color: #820014; }
+        .status-badge.done { background: #f6ffed; color: #135200; }
+        .history-empty {
+            text-align: center;
+            color: #999;
+            padding: 20px;
+            font-size: 13px;
+        }
+
+        @media (max-width: 500px) {
+            .card { padding: 20px; }
+            body { padding: 16px 10px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📞 坐席录音上传</h1>
+    <p class="subtitle">上传每日通话录音文件，自动归档至训练系统</p>
+
+    <!-- Upload form -->
+    <div class="card">
+        <form id="uploadForm" enctype="multipart/form-data" method="post" action="/upload">
+            <div class="form-row" id="agentRow">
+                <label for="agent_id">坐席工号 <span class="hint" id="agentHint">(必填)</span></label>
+                <input type="text" id="agent_id" name="agent_id"
+                       placeholder="例如: AGENT001" required
+                       maxlength="64" autocomplete="off">
+                <div class="field-note" id="agentNote">
+                    如文件名包含坐席 ID（3 段式），选择文件后将自动填充
+                </div>
+            </div>
+
+            <div class="form-row">
+                <label for="biz_system">业务系统 <span class="hint">(必选)</span></label>
+                <select id="biz_system" name="biz_system" required>
+                    <option value="collection">催收 (collection)</option>
+                    <option value="cs">客服 (cs)</option>
+                </select>
+            </div>
+
+            <div class="form-row">
+                <label>选择录音文件 <span class="hint">(必选, WAV/MP3/ulaw/alaw)</span></label>
+                <div class="dropzone" id="dropzone">
+                    <div class="icon">📁</div>
+                    <div class="text">点击或拖拽文件到此区域</div>
+                    <div class="ext-hint">支持 .wav .mp3 .ulaw .alaw，文件需大于 1KB</div>
+                    <input type="file" id="audioFile" name="audio_data"
+                           accept=".wav,.mp3,.ulaw,.alaw,audio/wav,audio/mpeg,audio/basic">
+                </div>
+                <div class="validation-msg" id="fileValidateMsg"></div>
+            </div>
+
+            <div class="form-row">
+                <label>文件名命名规则</label>
+                <div style="background:#fafafa;padding:10px 14px;border-radius:6px;font-size:13px;color:#555;line-height:1.8;">
+                    <div><strong>格式一（2 段）</strong> <code style="background:#e6f7ff;padding:1px 6px;border-radius:3px;">{客户标识}-{YYMMDDHHMM}.wav</code><br>
+                    <span style="color:#888;">坐席工号需手动填写</span></div>
+                    <div style="margin-top:6px;"><strong>格式二（3 段）</strong> <code style="background:#e6f7ff;padding:1px 6px;border-radius:3px;">{坐席ID}-{客户标识}-{YYMMDDHHMM}.wav</code><br>
+                    <span style="color:#888;">坐席工号从文件名自动提取</span></div>
+                    <div style="margin-top:6px;color:#999;font-size:12px;">示例: 张三-2606071621.mp3 或 AGENT001-张三-2606071621.mp3</div>
+                </div>
+            </div>
+
+            <div class="submit-area">
+                <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
+                    ↑ 上传
+                </button>
+                <button type="reset" class="btn btn-secondary" id="resetBtn">清空</button>
+            </div>
+        </form>
+
+        <!-- Progress bar -->
+        <div class="progress-wrap" id="progressWrap">
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-text" id="progressText">上传中...</div>
+        </div>
+
+        <!-- Result -->
+        <div class="result" id="result"></div>
+    </div>
+
+    <!-- Recent uploads -->
+    <div class="card">
+        <h2>📋 最近上传记录</h2>
+        <div class="history-list" id="historyList">
+            <div class="history-empty">加载中...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    // ── DOM refs ──────────────────────────────────────────────────────
+    const form = document.getElementById('uploadForm');
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('audioFile');
+    const agentInput = document.getElementById('agent_id');
+    const agentRow = document.getElementById('agentRow');
+    const agentHint = document.getElementById('agentHint');
+    const agentNote = document.getElementById('agentNote');
+    const bizSelect = document.getElementById('biz_system');
+    const submitBtn = document.getElementById('submitBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const fileValidateMsg = document.getElementById('fileValidateMsg');
+    const progressWrap = document.getElementById('progressWrap');
+    const progressFill = document.getElementById('progressFill');
+    const progressText = document.getElementById('progressText');
+    const resultDiv = document.getElementById('result');
+    const historyList = document.getElementById('historyList');
+
+    // ── Constants ─────────────────────────────────────────────────────
+    const VALID_EXTS = ['.wav', '.mp3', '.ulaw', '.alaw'];
+    const MIN_FILE_SIZE = 1024; // 1KB
+
+    // ── File dropzone ─────────────────────────────────────────────────
+    function formatFileSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+        return (bytes/1024/1024).toFixed(1) + ' MB';
+    }
+
+    function updateDropzone(file) {
+        if (!file) {
+            dropzone.classList.remove('has-file');
+            dropzone.innerHTML = `
+                <div class="icon">📁</div>
+                <div class="text">点击或拖拽文件到此区域</div>
+                <div class="ext-hint">支持 .wav .mp3 .ulaw .alaw，文件需大于 1KB</div>
+            `;
+            dropzone.appendChild(fileInput);
+            fileValidateMsg.textContent = '';
+            fileValidateMsg.className = 'validation-msg';
+            return;
+        }
+
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+        const sizeOk = file.size > MIN_FILE_SIZE;
+        const extOk = VALID_EXTS.includes(ext);
+        const valid = sizeOk && extOk;
+
+        let meta = formatFileSize(file.size);
+        if (!sizeOk) meta += ' — ❌ 文件过小';
+        if (!extOk) meta += ' — ❌ 不支持格式';
+
+        dropzone.classList.add('has-file');
+        dropzone.innerHTML = `
+            <div class="file-info">
+                <div class="name">📄 ${file.name}</div>
+                <div class="meta">${meta}</div>
+            </div>
+            <button type="button" class="remove-btn" id="removeFileBtn" title="移除文件">✕</button>
+        `;
+        dropzone.appendChild(fileInput);
+
+        document.getElementById('removeFileBtn').addEventListener('click', function(e) {
+            e.stopPropagation();
+            fileInput.value = '';
+            updateDropzone(null);
+            // Restore agent field
+            resetAgentField();
+            validateForm();
+        });
+    }
+
+    // Dropzone click
+    dropzone.addEventListener('click', function(e) {
+        if (e.target.closest('.remove-btn')) return;
+        fileInput.click();
+    });
+
+    // Drag & drop
+    dropzone.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        this.classList.add('dragover');
+    });
+    dropzone.addEventListener('dragleave', function(e) {
+        e.preventDefault();
+        this.classList.remove('dragover');
+    });
+    dropzone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        this.classList.remove('dragover');
+        if (e.dataTransfer.files.length) {
+            fileInput.files = e.dataTransfer.files;
+            handleFileSelected(e.dataTransfer.files[0]);
+        }
+    });
+
+    fileInput.addEventListener('change', function() {
+        if (this.files.length) {
+            handleFileSelected(this.files[0]);
+        }
+    });
+
+    // ── Agent field logic ─────────────────────────────────────────────
+    function resetAgentField() {
+        agentInput.disabled = false;
+        agentInput.required = true;
+        agentInput.value = '';
+        agentHint.textContent = '(必填)';
+        agentNote.textContent = '如文件名包含坐席 ID（3 段式），选择文件后将自动填充';
+        agentInput.style.background = '';
+    }
+
+    function setAgentAutoFilled(agentId) {
+        agentInput.value = agentId;
+        agentInput.disabled = true;
+        agentInput.required = false;
+        agentHint.textContent = '(自动提取)';
+        agentNote.textContent = '坐席 ID 从文件名第 1 段自动提取';
+        agentInput.style.background = '#f5f5f5';
+    }
+
+    function setAgentManual() {
+        agentInput.disabled = false;
+        agentInput.required = true;
+        agentHint.textContent = '(必填)';
+        agentNote.textContent = '文件名不含坐席 ID，请手动填写';
+        agentInput.style.background = '';
+    }
+
+    // ── Filename parsing (both formats) ──────────────────────────────
+    function parseFilename(filename) {
+        if (!filename) return null;
+        const nameNoExt = filename.replace(/\.[^.]+$/, '');
+        const parts = nameNoExt.split('-');
+
+        // Extract 10-digit timestamp from last part
+        var lastPart = parts[parts.length - 1] || '';
+        var tsDigits = '';
+        for (var i = 0; i < lastPart.length && tsDigits.length < 10; i++) {
+            var ch = lastPart[i];
+            if (ch >= '0' && ch <= '9') tsDigits += ch;
+        }
+
+        var validTs = tsDigits.length === 10;
+        var hhOk = true, mmOk = true;
+        if (validTs) {
+            var hh = parseInt(tsDigits.substring(6, 8), 10);
+            var mm = parseInt(tsDigits.substring(8, 10), 10);
+            if (hh > 23) hhOk = false;
+            if (mm > 59) mmOk = false;
+        }
+
+        return {
+            nameNoExt: nameNoExt,
+            numParts: parts.length,
+            parts: parts,
+            tsDigits: validTs ? tsDigits : null,
+            tsValid: validTs && hhOk && mmOk,
+            tsError: !validTs ? '未找到 10 位时间戳' :
+                     (!hhOk ? '小时无效' : '分钟无效')
+        };
+    }
+
+    function formatTimestamp(tsDigits) {
+        return '20' + tsDigits.substring(0,2) + '-' +
+               tsDigits.substring(2,4) + '-' +
+               tsDigits.substring(4,6) + ' ' +
+               tsDigits.substring(6,8) + ':' +
+               tsDigits.substring(8,10);
+    }
+
+    function validateFile(file) {
+        if (!file) return { type: '', text: '' };
+
+        var ext = '.' + file.name.split('.').pop().toLowerCase();
+        var extOk = VALID_EXTS.includes(ext);
+        var sizeOk = file.size > MIN_FILE_SIZE;
+
+        if (!extOk) return { type: 'error', text: '⚠️ 不支持的文件格式 "' + ext + '"' };
+        if (!sizeOk) return { type: 'error', text: '⚠️ 文件过小 (' + file.size + ' bytes)，需大于 1KB' };
+
+        var info = parseFilename(file.name);
+        if (!info || !info.tsValid) {
+            return { type: 'error', text: '⚠️ 文件名无效：' + (info ? info.tsError : '解析失败') };
+        }
+
+        // Build detailed message
+        var msgs = [];
+        if (info.numParts === 2) {
+            msgs.push('客户="' + info.parts[0] + '"');
+        } else if (info.numParts === 3) {
+            msgs.push('坐席="' + info.parts[0] + '"');
+            msgs.push('客户="' + info.parts[1] + '"');
+        } else {
+            return { type: 'error', text: '⚠️ 文件名需要 2 段或 3 段（用 "-" 分隔）' };
+        }
+        msgs.push('时间=' + formatTimestamp(info.tsDigits));
+
+        return { type: 'ok', text: '✅ 文件名有效: ' + msgs.join(', ') };
+    }
+
+    function handleFileSelected(file) {
+        updateDropzone(file);
+
+        // Parse filename for format detection
+        var info = parseFilename(file.name);
+        var msg = validateFile(file);
+        fileValidateMsg.textContent = msg.text;
+        fileValidateMsg.className = 'validation-msg ' + msg.type;
+
+        // Agent field logic
+        if (info && info.numParts === 3 && msg.type === 'ok') {
+            // 3-part filename: auto-extract agent ID
+            setAgentAutoFilled(info.parts[0]);
+        } else if (info && info.numParts === 2 && msg.type === 'ok') {
+            // 2-part filename: manual agent ID required
+            setAgentManual();
+        } else {
+            // Invalid filename: restore manual mode
+            if (!agentInput.disabled) {
+                // already manual, keep
+            } else {
+                setAgentManual();
+                agentInput.value = '';
+            }
+        }
+
+        validateForm();
+    }
+
+    // ── Form validation ─────────────────────────────────────────────
+    function validateForm() {
+        var agentOk = agentInput.disabled || agentInput.value.trim().length > 0;
+        var fileOk = fileInput.files.length > 0 && fileInput.files[0].size > MIN_FILE_SIZE;
+        var nameOk = validateFile(fileInput.files[0]).type === 'ok';
+        submitBtn.disabled = !(agentOk && fileOk && nameOk);
+    }
+
+    agentInput.addEventListener('input', validateForm);
+    bizSelect.addEventListener('change', validateForm);
+
+    // ── Form submit ─────────────────────────────────────────────────
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+
+        var file = fileInput.files[0];
+        if (!file || file.size <= MIN_FILE_SIZE) {
+            showResult(false, '文件无效或过小，请重新选择');
+            return;
+        }
+        var nameValid = validateFile(file);
+        if (nameValid.type === 'error') {
+            showResult(false, nameValid.text);
+            return;
+        }
+
+        // Re-enable agent input so its value is submitted
+        if (agentInput.disabled) {
+            agentInput.disabled = false;
+        }
+
+        submitBtn.disabled = true;
+        progressWrap.classList.add('active');
+        progressFill.style.width = '0%';
+        progressText.textContent = '上传中...';
+        resultDiv.classList.remove('active');
+
+        var progress = 0;
+        var progressInterval = setInterval(function() {
+            if (progress < 90) {
+                progress += Math.random() * 10;
+                if (progress > 90) progress = 90;
+                progressFill.style.width = progress + '%';
+            }
+        }, 300);
+
+        try {
+            var formData = new FormData();
+            formData.append('agent_id', agentInput.value.trim());
+            formData.append('biz_system', bizSelect.value);
+            formData.append('audio_data', file);
+
+            var response = await fetch('/upload', {
+                method: 'POST',
+                body: formData,
+            });
+
+            clearInterval(progressInterval);
+            progressFill.style.width = '100%';
+            progressText.textContent = '处理完成';
+
+            var data = await response.json();
+
+            if (response.ok && data.success) {
+                showResult(true, data.data || data);
+            } else {
+                var errMsg = data.detail || data.error || '上传失败';
+                showResult(false, errMsg);
+            }
+
+            loadHistory();
+
+        } catch (err) {
+            clearInterval(progressInterval);
+            progressFill.style.width = '100%';
+            progressText.textContent = '错误';
+            showResult(false, '网络错误: ' + err.message);
+        } finally {
+            submitBtn.disabled = false;
+            setTimeout(function() {
+                progressWrap.classList.remove('active');
+                progressFill.style.width = '0%';
+            }, 2000);
+        }
+    });
+
+    // ── Reset ───────────────────────────────────────────────────────
+    resetBtn.addEventListener('click', function() {
+        fileInput.value = '';
+        updateDropzone(null);
+        resetAgentField();
+        resultDiv.classList.remove('active');
+        resultDiv.innerHTML = '';
+        validateForm();
+    });
+
+    // ── Show result ─────────────────────────────────────────────────
+    function showResult(success, data) {
+        progressWrap.classList.remove('active');
+        submitBtn.disabled = false;
+        resultDiv.classList.add('active');
+
+        if (success && typeof data === 'object') {
+            var isDup = data.duplicate ? ' (重复上传)' : '';
+            resultDiv.className = 'result active success';
+            resultDiv.innerHTML = [
+                '<strong>✅ 上传成功' + isDup + '</strong>',
+                '<div class="detail"><table>',
+                '<tr><td>录音ID</td><td>' + (data.recording_id || '-') + '</td></tr>',
+                '<tr><td>call_id</td><td>' + (data.call_id || '-') + '</td></tr>',
+                '<tr><td>坐席工号</td><td>' + (data.agent_id || '-') + '</td></tr>',
+                '<tr><td>客户标识</td><td>' + (data.customer_phone || '-') + '</td></tr>',
+                '<tr><td>时间戳</td><td>' + (data.call_timestamp || '-') + '</td></tr>',
+                '<tr><td>状态</td><td>' + (data.status || 'raw') + '</td></tr>',
+                '</table></div>',
+                '<div style="margin-top:10px;">',
+                '<button type="button" class="btn btn-secondary"',
+                'onclick="location.reload()" style="padding:6px 16px;font-size:13px;">',
+                '↑ 继续上传',
+                '</button></div>'
+            ].join('');
+        } else {
+            resultDiv.className = 'result active error';
+            var msg = typeof data === 'string' ? data : '未知错误';
+            resultDiv.innerHTML = '<strong>❌ 上传失败</strong><div class="detail">' + msg + '</div>';
+        }
+    }
+
+    // ── History ─────────────────────────────────────────────────────
+    async function loadHistory() {
+        historyList.innerHTML = '<div class="history-empty">加载中...</div>';
+        try {
+            var resp = await fetch('/upload/history?limit=10');
+            var data = await resp.json();
+            var items = data.data || [];
+
+            if (!items.length) {
+                historyList.innerHTML = '<div class="history-empty">暂无上传记录</div>';
+                return;
+            }
+
+            historyList.innerHTML = items.map(function(item) {
+                var badgeClass = item.status === 'error' ? 'error' :
+                    (item.status === 'raw' ? 'raw' : 'done');
+                return '<div class="history-item">' +
+                    '<span><strong>' + esc(item.agent_id || '-') + '</strong> ' +
+                    esc(item.customer_phone || '-') + '</span>' +
+                    '<span><span class="status-badge ' + badgeClass + '">' +
+                    esc(item.status) + '</span> ' +
+                    '<span style="color:#999;font-size:12px;margin-left:6px;">' +
+                    (item.call_timestamp ? item.call_timestamp.substring(0, 16).replace('T', ' ') : '') +
+                    '</span></span></div>';
+            }).join('');
+        } catch (err) {
+            historyList.innerHTML = '<div class="history-empty">加载失败: ' + err.message + '</div>';
+        }
+    }
+
+    function esc(text) {
+        var div = document.createElement('div');
+        div.appendChild(document.createTextNode(text));
+        return div.innerHTML;
+    }
+
+    // ── Init ────────────────────────────────────────────────────────
+    loadHistory();
+    validateForm();
+    setInterval(loadHistory, 30000);
+})();
+</script>
+</body>
+</html>

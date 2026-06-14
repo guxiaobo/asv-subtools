@@ -67,24 +67,38 @@ MODEL_CONFIGS = [
 # ─── Feature extraction (no librosa dependency) ────────────────────────────
 
 def load_wav_norm(path: Path) -> np.ndarray:
-    """Load WAV as mono 16kHz float32."""
+    """Load WAV as mono 16kHz float32.
+
+    跨平台兼容：自动搜索 ffmpeg 可执行文件（PATH 环境变量）。
+    """
     import soundfile as sf
+    import shutil
     try:
         data, sr = sf.read(str(path))
     except Exception:
         import io, subprocess
-        ffmpeg = "/opt/homebrew/bin/ffmpeg"
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise FileNotFoundError(
+                "ffmpeg not found in PATH; install ffmpeg or use a "
+                "directly supported audio format"
+            )
         r = subprocess.run(
-            [ffmpeg, "-y", "-i", str(path), "-ar", "16000", "-ac", "1",
+            [ffmpeg_path, "-y", "-i", str(path), "-ar", "16000", "-ac", "1",
              "-f", "wav", "-loglevel", "error", "pipe:1"],
             capture_output=True, timeout=30,
         )
         data, sr = sf.read(io.BytesIO(r.stdout))
     if sr != 16000:
         import io, subprocess
-        ffmpeg = "/opt/homebrew/bin/ffmpeg"
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise FileNotFoundError(
+                "ffmpeg not found in PATH; install ffmpeg or use a "
+                "directly supported audio format"
+            )
         r = subprocess.run(
-            [ffmpeg, "-y", "-i", str(path), "-ar", "16000", "-ac", "1",
+            [ffmpeg_path, "-y", "-i", str(path), "-ar", "16000", "-ac", "1",
              "-f", "wav", "-loglevel", "error", "pipe:1"],
             capture_output=True, timeout=30,
         )

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>模型管理 - ASV 声纹识别系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f1f5f9; min-height: 100vh; }
+        .navbar { background: #1e3a5f; color: white; padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+        .navbar h2 { font-size: 18px; }
+        .nav-links a { color: #94a3b8; text-decoration: none; margin-left: 20px; font-size: 14px; }
+        .nav-links a:hover { color: white; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card h3 { font-size: 18px; color: #1e293b; margin-bottom: 16px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 16px; }
+        .stat-box { background: #f8fafc; border-radius: 10px; padding: 20px; text-align: center; }
+        .stat-box .num { font-size: 32px; font-weight: 700; color: #1e40af; }
+        .stat-box .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+        .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+        .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: #1e40af; color: white; }
+        .btn-primary:hover:not(:disabled) { background: #1e3a8a; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-success:hover:not(:disabled) { background: #15803d; }
+        .btn-warning { background: #d97706; color: white; }
+        .btn-warning:hover:not(:disabled) { background: #b45309; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+        .btn-secondary { background: #64748b; color: white; }
+        .btn-secondary:hover:not(:disabled) { background: #475569; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px 10px; text-align: left; font-size: 13px; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f8fafc; color: #64748b; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+        .badge-raw { background: #fef3c7; color: #92400e; }
+        .badge-preprocessed { background: #dbeafe; color: #1d4ed8; }
+        .badge-training { background: #ede9fe; color: #6d28d9; }
+        .badge-done { background: #dcfce7; color: #15803d; }
+        .badge-error { background: #fef2f2; color: #dc2626; }
+        .badge-pending { background: #f1f5f9; color: #64748b; }
+        .msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; white-space: pre-wrap; }
+        .msg.info { background: #eff6ff; color: #1d4ed8; }
+        .msg.success { background: #f0fdf4; color: #16a34a; }
+        .msg.error { background: #fef2f2; color: #dc2626; }
+        .loading { display: inline-block; width: 16px; height: 16px; border: 2px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .filter-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+        .filter-bar select { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 13px; outline: none; }
+        .filter-bar input { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 13px; outline: none; }
+        .empty { text-align: center; padding: 40px; color: #94a3b8; font-size: 14px; }
+        .output-box { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; font-family: 'Menlo', 'Monaco', monospace; font-size: 12px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; display: none; }
+        @media (max-width: 640px) {
+            table { font-size: 11px; }
+            th, td { padding: 4px 6px; }
+        }
+    </style>
+</head>
+<body>
+<div class="navbar">
+    <h2>🔊 ASV 模型管理</h2>
+    <div class="nav-links">
+        <a href="/model-manager">首页</a>
+        <a href="/change-password">修改密码</a>
+        <a href="/logout">注销</a>
+    </div>
+</div>
+<div class="container">
+    <div id="flashMsg"></div>
+
+    <!-- 统计数据 -->
+    <div class="card">
+        <h3>📊 概览</h3>
+        <div class="stats">
+            <div class="stat-box"><div class="num">{{ pending_preprocess }}</div><div class="label">待预处理</div></div>
+            <div class="stat-box"><div class="num">{{ pending_train }}</div><div class="label">待训练</div></div>
+            <div class="stat-box"><div class="num">{{ recordings|length }}</div><div class="label">总录音数（最近200条）</div></div>
+        </div>
+
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="runAction('preprocess')">🔄 批量预处理（VAD）</button>
+            <button class="btn btn-warning" onclick="runAction('label')">🏷️ 说话人打标</button>
+            <button class="btn btn-success" onclick="runAction('train')">📈 增量训练</button>
+            <button class="btn btn-secondary" onclick="runAction('evaluate')">📊 模型评估对比</button>
+            <button class="btn btn-danger" onclick="runAction('publish')">🚀 发布线上模型</button>
+        </div>
+        <div id="actionOutput" class="output-box"></div>
+    </div>
+
+    <!-- 录音列表 -->
+    <div class="card">
+        <h3>📋 录音管理</h3>
+        <div class="filter-bar">
+            <form method="get" action="/model-manager" style="display:flex;gap:8px;align-items:center;">
+                <label style="font-size:13px;color:#64748b;">状态筛选</label>
+                <select name="status_filter" onchange="this.form.submit()">
+                    <option value="">全部</option>
+                    <option value="raw" {% if status_filter == 'raw' %}selected{% endif %}>raw（原始）</option>
+                    <option value="preprocessed" {% if status_filter == 'preprocessed' %}selected{% endif %}>preprocessed（已预处理）</option>
+                    <option value="error" {% if status_filter == 'error' %}selected{% endif %}>error（错误）</option>
+                </select>
+                <noscript><button type="submit" class="btn btn-sm btn-primary">筛选</button></noscript>
+            </form>
+        </div>
+        {% if recordings %}
+        <div style="overflow-x:auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>坐席</th>
+                    <th>客户</th>
+                    <th>通话时间</th>
+                    <th>时长</th>
+                    <th>状态</th>
+                    <th>预处理</th>
+                    <th>训练</th>
+                    <th>模型版本</th>
+                    <th>上传时间</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in recordings %}
+                <tr>
+                    <td>{{ r.id }}</td>
+                    <td>{{ r.agent_id }}</td>
+                    <td>{{ r.customer_phone }}</td>
+                    <td>{{ r.call_timestamp[:16] if r.call_timestamp else '-' }}</td>
+                    <td>{{ '%.1f'|format(r.duration_sec) if r.duration_sec else '-' }}s</td>
+                    <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+                    <td><span class="badge badge-{{ r.pre_status or 'pending' }}">{{ r.pre_status or 'pending' }}</span></td>
+                    <td><span class="badge badge-{{ r.train_status or 'pending' }}">{{ r.train_status or 'pending' }}</span></td>
+                    <td>{{ r.model_version or '-' }}</td>
+                    <td>{{ r.created_at[:16] if r.created_at else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        {% else %}
+        <div class="empty">暂无录音数据</div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+async function runAction(action) {
+    const outputDiv = document.getElementById('actionOutput');
+    outputDiv.style.display = 'block';
+    outputDiv.innerHTML = '<span class="loading"></span> 正在执行 ' + action + '...';
+
+    const buttons = document.querySelectorAll('.btn-group .btn');
+    buttons.forEach(b => b.disabled = true);
+
+    try {
+        let url = '/model-manager/run-' + action;
+        let options = { method: 'POST' };
+
+        if (action === 'publish') {
+            const version = prompt('输入版本号（留空自动生成）:', '');
+            const data = new FormData();
+            data.append('version', version || '');
+            options.body = data;
+        }
+
+        const resp = await fetch(url, options);
+        const result = await resp.json();
+
+        if (result.success) {
+            outputDiv.innerHTML = '✅ ' + action + ' 执行成功\n';
+            if (result.stdout) outputDiv.innerHTML += '\n--- 输出 ---\n' + result.stdout;
+            if (result.stderr) outputDiv.innerHTML += '\n--- 错误输出 ---\n' + result.stderr;
+            flashMsg(action + ' 执行完成', 'success');
+            // 自动刷新页面数据
+            setTimeout(() => location.reload(), 3000);
+        } else {
+            outputDiv.innerHTML = '❌ ' + action + ' 执行失败\n' + (result.error || '');
+            if (result.stderr) outputDiv.innerHTML += '\n' + result.stderr;
+            flashMsg(action + ' 执行失败', 'error');
+        }
+    } catch (e) {
+        outputDiv.innerHTML = '❌ 网络错误: ' + e.message;
+        flashMsg('网络错误', 'error');
+    } finally {
+        buttons.forEach(b => b.disabled = false);
+    }
+}
+
+function flashMsg(text, type) {
+    const el = document.getElementById('flashMsg');
+    el.innerHTML = `<div class="msg ${type}">${text}</div>`;
+    setTimeout(() => el.innerHTML='', 5000);
+}
+</script>
+</body>
+</html>

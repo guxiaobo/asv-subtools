@@ -20,9 +20,9 @@ import yaml
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "db_path": "",  # empty => <proj_root>/data/training.db
-    "recordings_root": "/data/local_recordings",
-    "preprocessed_root": "/data/preprocessed",
-    "test_set_path": "data/test_set",
+    "recordings_root": "",  # empty => <proj_root>/data/local_recordings
+    "preprocessed_root": "",  # empty => <proj_root>/data/preprocessed
+    "test_set_path": "",  # empty => <proj_root>/data/test_set
     "preprocessing": {
         "target_sample_rate": 16000,
         "min_segment_sec": 0.5,
