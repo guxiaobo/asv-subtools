@@ -34,6 +34,7 @@ from routers import health as health_router
 from routers import recordings as recordings_router
 from routers import upload_web as upload_web_router
 from routers import verify as verify_router
+from routers import model_manager_router
 from routers import auth_router as auth_router_mod
 from services.audio import AudioLoader, AudioLoadError, InsufficientAudioError
 from services.cache import create_cache
@@ -193,6 +194,7 @@ app.include_router(verify_router.router)
 app.include_router(recordings_router.router)
 app.include_router(upload_web_router.router)
 app.include_router(auth_router_mod.router)  # 登录/用户管理/角色页面
+app.include_router(model_manager_router.router)  # 录音断句/打标/训练/模型管理等
 
 
 # ---------------------------------------------------------------------------

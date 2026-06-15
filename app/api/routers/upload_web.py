@@ -57,7 +57,7 @@ def _get_recordings_root() -> Path:
 # Validators & metadata extraction
 # -------------------------------------------------------------------
 
-ALLOWED_EXTENSIONS = {".wav", ".mp3", ".ulaw", ".alaw"}
+ALLOWED_EXTENSIONS = {".wav", ".mp3", ".ulaw", ".alaw", ".awb"}
 MIN_FILE_SIZE = 1024  # 1KB
 
 

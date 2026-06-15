@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import asyncio
 import subprocess
 import sys
 from datetime import datetime
@@ -55,6 +56,15 @@ logger = logging.getLogger("asv-api.auth_router")
 router = APIRouter(tags=["auth"])
 
 project_root = Path(__file__).resolve().parent.parent.parent  # app/
+
+
+def _train_env() -> dict:
+    """Return env with app/ on PYTHONPATH so train/* scripts can import from train."""
+    env = os.environ.copy()
+    app_dir = str(project_root)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{app_dir}:{existing}" if existing else app_dir
+    return env
 
 
 # ======================================================================
@@ -373,6 +383,12 @@ async def model_manager_dashboard(
 async def run_preprocess(request: Request):
     """启动批量预处理（VAD 分割 + 说话人分离）。"""
     user = await require_role(ROLE_MODEL_MANAGER)(request)
+    recording_id = None
+    try:
+        body = await request.json()
+        recording_id = body.get("recording_id")
+    except Exception:
+        pass
     try:
         # 调用训练系统的预处理脚本
         script = project_root / "train" / "preprocess.py"
@@ -382,12 +398,19 @@ async def run_preprocess(request: Request):
                 "error": f"预处理脚本不存在: {script}",
             }, status_code=500)
 
-        result = subprocess.run(
-            [sys.executable, str(script), "--all"],
-            cwd=str(project_root.parent),  # project root
+        env = _train_env()
+        args = [sys.executable, str(script)]
+        if recording_id:
+            args.extend(["--recording-id", str(recording_id)])
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            args,
+            cwd=str(project_root),
             capture_output=True,
             text=True,
             timeout=3600,
+            env=env,
         )
         logger.info("Preprocess result: stdout=%s stderr=%s", result.stdout, result.stderr)
 
@@ -412,22 +435,26 @@ async def run_preprocess(request: Request):
 
 @router.post("/model-manager/run-label")
 async def run_label_speakers(request: Request):
-    """启动说话人打标（聚类 + 说话人标记）。"""
+    """启动说话人打标（跨录音聚合 + 客户声纹注册）。"""
     user = await require_role(ROLE_MODEL_MANAGER)(request)
     try:
-        script = project_root / "train" / "diarizer.py"
+        script = project_root / "train" / "preprocess.py"
         if not script.exists():
             return JSONResponse({
                 "success": False,
                 "error": f"打标脚本不存在: {script}",
             }, status_code=500)
 
-        result = subprocess.run(
-            [sys.executable, str(script), "--mode", "label", "--all"],
+        env = _train_env()
+        args = [sys.executable, str(script), "--cross-aggregate-only"]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            args,
             cwd=str(project_root),
             capture_output=True,
             text=True,
             timeout=7200,
+            env=env,
         )
         return {
             "success": result.returncode == 0,
@@ -449,16 +476,18 @@ async def run_incremental_train(request: Request):
     """启动增量训练。"""
     user = await require_role(ROLE_MODEL_MANAGER)(request)
     try:
-        script = project_root / "train" / "incremental_train.py"
-        if not script.exists():
-            script = project_root / "train" / "fine_tune.py"
+        script = project_root / "train" / "fine_tune.py"
 
-        result = subprocess.run(
-            [sys.executable, str(script), "--all"],
+        env = _train_env()
+        args = [sys.executable, str(script), "--model", "all"]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            args,
             cwd=str(project_root),
             capture_output=True,
             text=True,
             timeout=14400,
+            env=env,
         )
         return {
             "success": result.returncode == 0,
@@ -480,16 +509,18 @@ async def run_evaluate(request: Request):
     """启动模型评估对比。"""
     user = await require_role(ROLE_MODEL_MANAGER)(request)
     try:
-        script = project_root / "train" / "incremental_compare.py"
-        if not script.exists():
-            script = project_root / "train" / "evaluate.py"
+        script = project_root / "train" / "evaluate.py"
 
-        result = subprocess.run(
-            [sys.executable, str(script), "--all"],
+        env = _train_env()
+        args = [sys.executable, str(script), "--model", "all"]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            args,
             cwd=str(project_root),
             capture_output=True,
             text=True,
             timeout=7200,
+            env=env,
         )
         return {
             "success": result.returncode == 0,
@@ -511,6 +542,7 @@ async def run_publish_model(request: Request, version: str = Form("")):
     user = await require_role(ROLE_MODEL_MANAGER)(request)
     try:
         script = project_root / "train" / "model_manager.py"
+        env = _train_env()
         args = [sys.executable, str(script), "--publish"]
         if version:
             args.extend(["--version", version])
@@ -521,6 +553,7 @@ async def run_publish_model(request: Request, version: str = Form("")):
             capture_output=True,
             text=True,
             timeout=300,
+            env=env,
         )
         return {
             "success": result.returncode == 0,

@@ -1,0 +1,11 @@
+{
+  "vad_threshold": 0.45,
+  "min_segment_sec": 1.5,
+  "max_segment_sec": 15,
+  "snr_threshold": 15,
+  "filter_leading_sec": 2,
+  "target_sample_rate": 16000,
+  "diarizer_model": "CAM++",
+  "diarizer_cluster_threshold": 0.55,
+  "apply_noise_reduction": true
+}

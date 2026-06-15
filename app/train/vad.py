@@ -366,6 +366,17 @@ def preprocess_recording(
     seg_for_save = [(wav, i) for i, (wav, _, _) in enumerate(segments)]
     seg_paths = save_segments(output_dir, prefix, seg_for_save, sr)
 
+    # Per-segment metadata (for audio_segments table)
+    segment_details = []
+    for seg_path, (wav, start, end) in zip(seg_paths, segments):
+        dur = len(wav) / sr
+        segment_details.append({
+            "file_path": str(seg_path),
+            "start_sec": round(start, 2),
+            "end_sec": round(end, 2),
+            "duration_sec": round(dur, 2),
+        })
+
     # Compute statistics
     total_sec = 0.0
     all_snr = []
@@ -376,6 +387,7 @@ def preprocess_recording(
         all_snr.append(snr_val)
 
     result["segment_count"] = len(segments)
+    result["segment_details"] = segment_details
     if all_snr:
         result["avg_snr_db"] = round(float(np.mean(all_snr)), 1)
         result["min_snr_db"] = round(float(np.min(all_snr)), 1)

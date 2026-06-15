@@ -1,512 +1,295 @@
-# 模型结构与训练算法
+# 三模型声纹提取网络 — 架构与训练算法详解
 
-> 生成时间: 2026-06-10
-> 源码位置: `app/pytorch_models/`（PyTorch 定义）和 `app/train/`（训练流程）
-
----
-
-## 目录
-
-1. [整体架构](#1-整体架构)
-2. [CAM++ 模型](#2-cam-模型)
-3. [ResNet34 模型](#3-resnet34-模型)
-4. [ECAPA-TDNN 模型](#4-ecapa-tdnn-模型)
-5. [公共组件 layers](#5-公共组件-layers)
-6. [特征提取 (FBank)](#6-特征提取-fbank)
-7. [训练算法细节](#7-训练算法细节)
-8. [ONNX 推理模型](#8-onnx-推理模型)
-9. [模型版本管理与发布流程](#9-模型版本管理与发布流程)
-10. [模型对比 (evaluate.py)](#10-模型对比-evaluatepy)
+> 基于 `app/train/fine_tune.py`（增量训练脚本）中的精确模型定义，
+> 每个 checkpoint 的架构已通过 keys/shapes 验证，精确匹配原始预训练权重。
 
 ---
 
-## 1. 整体架构
+## 1. CAM++
 
-系统维护 **三个声纹识别模型**，均采用预训练 backbone + 增量微调的方案：
+**文件:** `app/train/fine_tune.py` 第 293 行 `class CAMPlus`
+**预训练权重:** `app/pytorch_weights/campplus_cn_common.pt`
+**嵌入维度:** 192
+**来源:** Alibaba 3D-Speaker / egrecho CamPP
 
-| 模型 | 文件 | 嵌入维度 | 预训练来源 | 架构特点 |
-|------|------|----------|------------|----------|
-| **CAM++** | `campp_model.py` | 192 | 3D-Speaker (jingyaogong/campplus) | DenseNet + CAM (上下文感知掩码) |
-| **ResNet34** | `resnet34_model.py` | 256 | WeSpeaker (avg_model) | 2D ResNet34 + 统计池化 |
-| **ECAPA-TDNN** | `ecapa_model.py` | 192 | WeSpeaker (avg_model.pt) | SE-Res2Block + 注意力统计池化 |
-
-**权重文件位置**: `app/pytorch_weights/`
-- `campplus_cn_common.pt` — CAM++ 预训练权重 (9.5MB)
-- `avg_model` — ResNet34 预训练权重 (目录，无后缀)
-- `avg_model.pt` — ECAPA 预训练权重
-
-**训练时创建的模型**（在 `app/pytorch_weights/fine_tuned/` 下）:
-- `{model_name}_best.pt` — 最优 checkpoint
-- `{model_name}_final.pt` — 最终 checkpoint（含 projection 分类器）
-- `{model_name}_backbone.pt` — 去除分类器后的 backbone（用于部署推理）
-
----
-
-## 2. CAM++ 模型
-
-**文件**: `app/pytorch_models/campp_model.py`
-
-### 2.1 CAM++ 论文与设计思想
-
-CAM++ 的核心创新是 **Context Aware Masking (CAM)** 机制。传统 TDNN 使用固定的卷积核捕捉时间上下文，而 CAM 层动态地学习一个与输入相关的注意力掩码，使网络能够根据不同时段的语音特征自适应调整感受野。
-
-### 2.2 整体结构
+### 1.1 架构总览
 
 ```
-CamPP(input: B×T×80)
-  ├── head: FCM (前端 CNN 模块)
-  │     └── conv1(1→32) → BasicResBlock×2(stride=2) → BasicResBlock×2(stride=2)
-  │     └── conv2(32→32, stride=(2,1)) → reshape → (B, 32×(80/8), T) = (B, 320, T)
-  ├── xvector: Sequential
-  │     ├── tdnn: TDNNBlock(320→128, k=5, stride=2)  # 初始降维
-  │     ├── block1: CAMDenseTDNNBlock (12层, k=3, d=1)  # 第1密集块
-  │     ├── transit1: TransitLayer  (降维 128+12*32 → /2)
-  │     ├── block2: CAMDenseTDNNBlock (24层, k=3, d=2)  # 第2密集块 (膨胀卷积)
-  │     ├── transit2: TransitLayer  (降维)
-  │     ├── block3: CAMDenseTDNNBlock (16层, k=3, d=2)  # 第3密集块
-  │     ├── transit3: TransitLayer  (降维)
-  │     ├── out_nonlinear: BN+ReLU
-  │     ├── stats: StatsPool (全局均值+标准差)
-  │     └── dense: DenseLayer (通道数×2 → 192)
-  └── output: (B, 192) embedding
+FCM(2D前端, feat_dim=80)
+    → 输出 channels = 32 × (80÷8) = 320
+    → TDNN(320→128, k=5, stride=2)       # tdnn
+    → 3×CAMDenseTDNNBlock + TransitLayer  # block1~3 + transit1~3
+        block1: 12层, k=3, d=1 → transit(688→344)
+        block2: 24层, k=3, d=2 → transit(1112→556)
+        block3: 16层, k=3, d=2 → transit(1068→534)
+    → BN + ReLU (out_nonlinear)
+    → StatsPool (mean+std) → 1068
+    → DenseLayer(1068→192)               # dense
+    → Linear(192, num_speakers)           # projection（训练时才存在）
 ```
 
-### 2.3 关键子模块
+### 1.2 组件详解
 
-#### FCM (Front-end CNN Module)
-- 将原始的 80 维 fbank 特征通过 2D CNN 映射为时频特征
-- 使用 `BasicResBlock`（2D 残差块，stride 仅在频率轴）
-- 最终 reshape 为 (B, C×F', T) 供 1D TDNN 处理
-- `out_channels = m_channels * (feat_dim // 8)` = 32 × 10 = **320**
+**FCM（Front-end Convolution Module，第 99 行）**
+- 2D 前端：`Conv2d(1→32, k=3) + BN + ReLU`
+- 两层 BasicResBlock2D（stride=2 频域降采样）
+- 再一层 `Conv2d(32→32, k=3, stride=(2,1))`
+- 最终 reshape 合并通道×频域：`shape[1]*shape[2]`
+- 等效频域降采样率 = 8
 
-#### CAMLayer (Context-Aware Masking)
-- **双路径机制**:
-  - **局部路径**: `Conv1d` + 常规 1D 卷积提取局部特征
-  - **上下文路径**: 全局均值池化 + 分段池化 → 两层 FC → Sigmoid → 注意力掩码
-- 最终输出 = `y * m`（局部特征 × 上下文注意力掩码）
-- `seg_pooling`: 将时间轴分段池化 (seg_len=100)，上采样回原长度，提供分段级别的上下文
+**BasicResBlock2D（第 72 行）**
+- 标准 2D 残差块，stride=(s,1) 只在频域方向降采样
+- conv1 → BN → ReLU → conv2 → BN → shortcut → ReLU
+- expansion=1
 
-#### CAMDenseTDNNBlock
-- 密集连接 (DenseNet 风格)：每层输入 = 之前所有层的输出拼接
-- 每层 = BN+ReLU → 1×1 Conv (bottleneck) → BN+ReLU → CAMLayer
-- 增长率 (growth_rate) = 32：每层输出通道数
+**CAMLayer（Context-Aware Masking，第 135 行）**
+- 本地路径：`Conv1d + 分段池化 + 全局上下文`
+- 全局 sigmoid mask 调制本地卷积输出
+- `seg_pooling`：avg/max 分段池化（seg_len=100 帧），插值回原长度
+- 瓶颈缩减比 reduction=2
 
-#### TransitLayer
-- 密集块间的过渡层：BN+ReLU → 1×1 Conv (降维 2×)
-- 压缩信息密度，控制参数增长
+**CAMDenseTDNNBlock（第 190 行）**
+- Dense 连接堆叠：每层输入 = 前几层输出的 concat
+- 每层：BN+ReLU → Conv1d 1×1 → BN+ReLU → CAMLayer
+- growth_rate=32, bn_size=4
 
-### 2.4 前向传播维度变化
+**TransitLayer（第 213 行）**
+- BN+ReLU → Conv1d 1×1（通道数减半）
+- 控制维度增长，放在每个 Dense Block 之后
 
-```
-输入:  (B, T, 80)          特征维度 80
-permute → (B, 80, T)
-head:  (B, 320, T)         FCM 输出
-tdnn:  (B, 128, T/2)       stride=2 下采样
-block1: (B, 128+12*32, T/2) = (B, 512, T/2)   12 层密集增长
-transit1: (B, 256, T/2)    降维
-block2: (B, 256+24*32, T/2) = (B, 1024, T/2)  24 层密集增长
-transit2: (B, 512, T/2)    降维
-block3: (B, 512+16*32, T/2) = (B, 1024, T/2)  16 层密集增长
-transit3: (B, 512, T/2)    降维
-stats:  (B, 1024)          均值+标准差拼接
-dense:  (B, 192)           最终 embedding
+**StatsPool（第 226 行）**
+- 时间维度的 mean + std 拼接
+
+**DenseLayer（第 272 行）**
+- 纯 `Conv1d 1×1` 输出嵌入向量
+- **注意：** 去掉了原始实现中的 BN（因 batch_size=1 时 1×1 conv 输出 BN 零方差）
+
+### 1.3 前向传播
+
+```python
+def forward(self, x, return_embedding=False):
+    # x: (B, T, F)  # 模型要求的原始输入格式
+    x = x.permute(0, 2, 1)      # (B, F, T)
+    x = self.head(x)               # FCM → (B, 320, T)
+    x = self.xvector(x)            # Dense blocks → StatsPool → Dense → (B, 192)
+    if return_embedding or self.projection is None:
+        return x
+    return self.projection(x)
 ```
 
 ---
 
-## 3. ResNet34 模型
+## 2. ECAPA-TDNN
 
-**文件**: `app/pytorch_models/resnet34_model.py`
+**文件:** `app/train/fine_tune.py` 第 447 行 `class ECAPA_TDNNSpeaker`
+**预训练权重:** `app/pytorch_weights/avg_model.pt`
+**嵌入维度:** 192
+**来源:** 标准 ECAPA-TDNN 实现
 
-### 3.1 设计思想
-
-标准 ResNet34 架构，适用于说话人识别。相比图像 ResNet，去掉了最后的全局平均池化步长，改为直接 `AdaptiveAvgPool2d(1,1)`。后端用 `StatsPool` + `Linear` 输出 embedding。
-
-系统中有两个版本的 ResNet34：
-1. **`ResNet34`** (campp_model.py 下的纯 PyTorch 版本) — 较传统，2D 卷积，适应 WeSpeaker 检查点
-2. **`ResNet34_2D`** (fine_tune.py 内的版本) — 更灵活，支持动态 feat_dim，测试用的训练变体
-
-### 3.2 结构
+### 2.1 架构总览
 
 ```
-ResNet34(input: B×T×80)
-  ├── conv1: Conv2d(1→32, 3×3, stride=1) + BN + ReLU
-  ├── layer1: BasicBlock ×3 (32→32, stride=1)
-  ├── layer2: BasicBlock ×4 (32→64, stride=2)
-  ├── layer3: BasicBlock ×6 (64→128, stride=2)
-  ├── layer4: BasicBlock ×3 (128→256, stride=2)
-  ├── avgpool: AdaptiveAvgPool2d(1,1) → flatten → (B, 256)
-  └── fc: Linear(256→256) → embedding
+input: (B, F, T)
+    → layer1: TDNN(80→512, k=5) + BN + ReLU
+    → layer2: SE-Res2Block(512, d=2)
+    → layer3: SE-Res2Block(512, d=3)
+    → layer4: SE-Res2Block(512, d=4)
+    → concat(layer2, layer3, layer4) → (B, 1536, T)
+    → conv: Conv1d(1536→1536, k=1)     # MFA
+    → pool: AttentiveStatsPool(1536, hidden=128, time_attention=True)
+    → bn: BN(3072)
+    → linear: Linear(3072→192)
+    → projection: Linear(192, num_speakers)
 ```
 
-### 3.3 BasicBlock
+### 2.2 组件详解
 
-标准残差块：
-```
-conv3×3 → BN → ReLU → conv3×3 → BN → + shortcut → ReLU
-```
-`expansion=1`，输出通道 = 输入通道数。
+**Res2NetConvBlock（第 372 行）**
+- 将输入按 scale=8 分块（chunk into 8 groups）
+- 每个子块：Conv1d(out_ch→out_ch, k=3) + BN + ReLU
+- 残差连接：`sp = sp + xs[i+1]`
+- 最后 concat 所有子块输出
 
-### 3.4 与 fine_tune.py 中 ResNet34_2D 的区别
+**SEModule（第 399 行）**
+- Squeeze: 全局平均池化 → Linear(ch→128)
+- Excitation: ReLU → Linear(128→ch) → Sigmoid
+- 输出 = 输入 × attention 权重
 
-`fine_tune.py` 中的 `ResNet34_2D`:
-- `StatsPool` 替换 `AdaptiveAvgPool2d`：输出均值+标准差拼接
-- 支持 `feat_dim` 可配置（通过 `h_freq = ceil(feat_dim/8)` 计算）
-- 支持 `embedding_dim` 可配置
-- 与训练流程集成：选择框 `return_embedding` 控制是否返回 embedding 或分类 logits
+**SE_Res2Block（第 413 行）**
+- ModuleList 中有序包含 4 个组件：
+  - `[0]`: Conv1d(512→512, k=1) + BN（1×1 卷积降维）
+  - `[1]`: Res2NetConvBlock（分组卷积）
+  - `[2]`: Conv1d(512→512, k=1) + BN（1×1 卷积恢复维度）
+  - `[3]`: SEModule(512→128→512)
+- 残差连接：`x + residual`
+
+**AttentiveStatsPoolECAPA（第 507 行）**
+- `time_attention=True` 模式：attention 输入 = `concat(x, global_mean, global_std)`，维度 3×in_dim
+- `linear1: Conv1d(3×in_dim→128, k=1) → Tanh → linear2: Conv1d(128→in_dim, k=1) → Softmax`
+- 加权 mean + 加权 std（`Σαx² - (Σαx)²` 的平方根）
+
+### 2.3 关键细节
+
+- 所有 BN 使用 `momentum=0.5`（与原始 checkpoint 一致）
+- MFA 层（multi-layer feature aggregation）直接 concat 三层 SE-Res2Block 输出
+- 残差路径：`x2 = layer2(x)`, `x3 = layer3(x + x1)`, `x4 = layer4(x + x1 + x2)`
 
 ---
 
-## 4. ECAPA-TDNN 模型
+## 3. ResNet34 (2D)
 
-**文件**: `app/pytorch_models/ecapa_model.py`
+**文件:** `app/train/fine_tune.py` 第 567 行 `class ResNet34_2D`
+**预训练权重:** `app/pytorch_weights/avg_model`（无后缀）
+**嵌入维度:** 256
+**来源:** 标准 2D ResNet34 适配声纹
 
-### 4.1 设计思想
-
-ECAPA-TDNN 是 2020 年提出的增强版 TDNN，核心创新：
-1. **SE-Res2Block**: Res2Net 的多尺度卷积 + Squeeze-and-Excitation 通道注意力
-2. **多尺度特征融合**: 3个不同膨胀率的 SE-Res2Block 输出拼接
-3. **注意力统计池化 (Attentive StatsPool)**: 时间维度的注意力加权均值/标准差
-
-### 4.2 结构
+### 3.1 架构总览
 
 ```
-EcapaModel(input: B×T×80)
-  ├── ecapa: EcapaTdnn (核心骨干)
-  │     ├── layer1: Conv1d(80→512, k=5) + BN + ReLU
-  │     ├── layer2[0]: SE_Res2Block(512, dilation=1)   # 近端上下文
-  │     ├── layer2[1]: SE_Res2Block(512, dilation=2)   # 中程上下文
-  │     ├── layer2[2]: SE_Res2Block(512, dilation=3)   # 远程上下文
-  │     ├── concat: 拼接三层输出 → (B, 512*3, T)
-  │     ├── conv: Conv1d(1536→1536, k=1) + BN + ReLU  # MFA 层
-  │     └── output: (B, 1536, T)
-  ├── attention: Attentive StatsPool (torch-native)
-  │     ├── linear1: Conv1d(1536→128, 1) + Tanh
-  │     ├── linear2: Conv1d(128→1536, 1) + Softmax (时间注意力)
-  │     ├── mean = Σ(α·x)           # 注意力加权均值
-  │     └── std = sqrt(Σ(α·x²) − mean²)  # 注意力加权标准差
-  ├── bn: BatchNorm1d(3072)          # 拼接后归一化
-  ├── fc: Linear(3072→192)           # embedding 层
-  └── bn_out: BatchNorm1d(192)       # 输出归一化
+input: (B, 1, F, T)
+    → conv1: Conv2d(1→32, k=3×3, stride=1, padding=1) + BN + ReLU
+    → layer1: 3 × BasicBlock2D(32→32, stride=1)
+    → layer2: 4 × BasicBlock2D(32→64, stride=2)
+    → layer3: 6 × BasicBlock2D(64→128, stride=2)
+    → layer4: 3 × BasicBlock2D(128→256, stride=2)
+    → reshape: (B, 256×H, T)     # H = ceil(80/8) = 10
+    → StatsPool: (B, 5120)       # mean + std = 2×2560
+    → seg_1: Linear(5120→256)    # 嵌入层
+    → projection: Linear(256, num_speakers)
 ```
 
-### 4.3 SE-Res2Block
+### 3.2 降采样与维度计算
 
-```
-输入 x (B, C, T)
-  ├── conv1×1 → BN → ReLU                              # 降维/升维准备
-  ├── Channel Split: 分成 scale=8 组 (每组 C/8 通道)
-  │     └── 每组: Conv1d(C/8, C/8, k=3, dilation=d) → BN → ReLU → BN → ReLU
-  │            （第2组的输入包含第1组的输出 — 层次化特征）
-  ├── concat groups → (B, C, T)
-  ├── conv1×1 → BN → ReLU                              # 合并
-  ├── SE Module:
-  │     ├── GlobalAvgPool → Conv1d(C→C/8) → ReLU → Conv1d(C/8→C) → Sigmoid
-  │     └── x = x · attention                          # 通道重标定
-  └── + residual → 输出
-```
+- 三层 stride=2 的 layer，频域总降采样率 = 2³ = 8
+- feat_dim=80 → H = ceil(80/8) = 10
+- StatsPool 输入: (B, 256×10, T) = (B, 2560, T)
+- StatsPool 输出: (B, 5120) = (B, 2×2560)
+- 嵌入层: `Linear(5120, 256)`，固定输出 256 维
 
-### 4.4 前向传播维度变化
+### 3.3 BasicBlock2D（第 540 行）
 
-```
-输入:   (B, T, 80)
-permute → (B, 80, T)
-layer1: (B, 512, T)                   初始映射
-layer2[0]: (B, 512, T)                膨胀=1
-layer2[1]: (B, 512, T)                膨胀=2
-layer2[2]: (B, 512, T)                膨胀=3
-concat:  (B, 1536, T)                 三尺度拼接
-conv:    (B, 1536, T)                 MFA 融合
-attention: (B, 3072)                  注意力加权 mean+std
-bn:      (B, 3072)
-fc:      (B, 192)                     最终 embedding
-bn_out:  (B, 192)                     输出归一化
-```
-
-### 4.5 预训练权重的键名映射
-
-Wespeaker 的 checkpoint 键名与自定义 EcapaModel 不同，`create_ecapa_model` 中包含完整的键映射逻辑：
-
-| Wespeaker 键 | 本模型键 | 说明 |
-|---|---|---|
-| `layer1.conv` | `ecapa.layer1.conv` | 首层卷积 |
-| `layer2.se_res2block.N.0-4` | `ecapa.layer2.N.0-4` | SE-Res2Block 子层 |
-| `conv` | `ecapa.conv` | MFA 卷积 |
-| `bn` | `ecapa.bn` | MFA BN |
-| `attention.linear1/2` | `attention.linear1/2` | 注意力层（直接匹配） |
-| `bn2` | `bn` | 统计池化后的 BN |
-| `fc` | `fc` | 全连接层（直接匹配） |
-| `bn3` | `bn_out` | 输出 BN |
+- 标准 2D 残差块
+- conv1(k=3, stride) → BN(m=0.5) → ReLU → conv2(k=3, stride=1) → BN(m=0.5) → +shortcut → ReLU
+- stride≠1 时 1×1 卷积 shortcut
 
 ---
 
-## 5. 公共组件 Layers
+## 4. FBank 特征提取
 
-**文件**: `app/pytorch_models/components.py`
+**文件:** `app/train/fine_tune.py` 第 642 行 `class FBankExtractor`
 
-公共组件库，被三个模型共享：
+纯 PyTorch 实现，无 torchaudio 依赖：
 
-| 组件 | 用途 |
-|---|---|
-| `Mish` | Mish 激活函数 `x * tanh(softplus(x))` |
-| `Swish` | Swish 激活函数 `x * sigmoid(x)` |
-| `Nonlinearity(nl)` | 工厂函数：返回 ReLU / Mish / Swish / SiLU / Identity |
-| `get_bn_relu(channels)` | BN + ReLU 顺序序列 |
-| `statistics_pooling(x)` | 全局均值+标准差池化（functional） |
-| `StatsPool` | `statistics_pooling` 的 Module 封装 |
-| `TDNNBlock` | 1D 卷积 + 非线性 + BN（支持 pre_norm 顺序切换） |
-| `DenseLayer` | 继承 TDNNBlock，1×1 Conv + BN (affine=False) 用于最终 embedding |
-| `SERes2Block` | SE-Res2Block 的独立实现（与 ecapa_model 中的不同版本） |
-
----
-
-## 6. 特征提取 (FBank)
-
-**文件**: `app/train/fine_tune.py` 第 642-703 行 (FBankExtractor 类)
-
-纯 PyTorch/numpy 实现，无 torchaudio 依赖：
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| n_mels | 80 | Mel 滤波器组数 |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| n_mels | 80 | 梅尔滤波器数量 |
 | sr | 16000 | 采样率 |
-| n_fft | 512 | FFT 点数 |
-| hop_length | 160 | 帧移 (10ms @ 16kHz) |
-| win_length | 400 | 帧长 (25ms @ 16kHz) |
-| f_min | 0 | 最低频率 |
-| f_max | 8000 | 最高频率 |
+| n_fft | 512 | STFT 窗口大小 |
+| hop_length | 160 | 帧移（10ms） |
+| win_length | 400 | 窗口长度（25ms） |
+| f_min / f_max | 0 / 8000 | 频率范围 |
 
-**流程**: `波形 → STFT → Mel滤波器组 → log → (T, 80)`
+预处理流程：Hann 窗 → STFT → |mag|² → mel_filterbank → log → (T, 80)
 
 ---
 
-## 7. 训练算法细节
+## 5. 训练算法
 
-**文件**: `app/train/fine_tune.py` 函数 `train_model()`
+### 5.1 数据构建 (`build_training_data`, 第 745 行)
 
-### 7.1 数据加载
+1. 从 SQLite `recordings` 表查询 `status='preprocessed'` 的录音
+2. 从 `audio_segments` 表查询所有段
+3. 对每通录音的 VAD 段，用 `SpeakerDiarizer`（Otsu 双峰法）标注坐席/客户
+4. 只保留标注为 `customer` 的段作为训练数据
+5. 按客户电话号码（customer_phone）作为说话人 ID
+6. 返回 `[(wav_path, speaker_id), ...]` 列表 + `id_to_speaker` 映射
 
+### 5.2 数据集 (`SpeakerDataset`, 第 710 行)
+
+- 滑动窗口加载：每条段随机裁剪/pad 到 400 帧（4 秒 @ 10ms）
+- 段 < 400 帧 → pad；段 > 400 帧 → 随机切取 400 帧
+
+### 5.3 优化器 (第 967 行)
+
+**两阶段 Adam：**
 ```python
-build_training_data()  →  [(wav_path, speaker_id), ...], {id: name}
-```
-
-- 从 `data/training.db` 查询 `recordings` 表（`status='preprocessed'`）
-- 从 `data/preprocessed/collection/{date}/{call_id}/` 读取 VAD 段
-- 每通录音运行 `SpeakerDiarizer.diarize()` 区分坐席/客户段
-- **仅取客户段**用于训练（坐席段跳过）
-- 按说话人（customer_phone）映射为 speaker_id
-- 说话人均衡：每条录音的 diarizer 输出中，客户段被收集到对应说话人名下
-
-### 7.2 数据集分割
-
-每个说话人在各自段中按 85/15 随机划分（`val_split=0.15`）：
-- 使用 `defaultdict` 收集每个说话人的段
-- 每个说话人至少保留 1 个验证段（`n_val = max(1, int(n * val_split))`）
-
-### 7.3 SpeakerDataset 与 DataLoader
-
-```python
-class SpeakerDataset(Dataset):
-    def __getitem__(self, idx):
-        wav_path, sid = self.segments[idx]
-        feat = fbank.extract_from_file(wav_path)   # (T, 80)
-        if T > max_frames:   随机裁剪一段
-        elif T < max_frames: 零填充到 max_frames
-        return feat, sid
-```
-
-- `max_frames=400`（对应 4s @ 10ms 帧移）
-- `collate_fn`: 堆叠 feat 和 sid 为 batch
-- `batch_size=32`（默认），`shuffle=True`
-- `drop_last=True`（防止最后一个 batch shape 不一致）
-- `num_workers=0`（避免多进程 init 问题）
-
-### 7.4 模型加载与分类器扩展
-
-```python
-model = CAMPlus(feat_dim=80, embedding_dim=192, num_speakers=num_speakers)
-state_dict = torch.load(ckpt_path, weights_only=True)
-model.load_pretrained(state_dict)
-```
-
-关键：**预训练权重不含分类器**（`num_speakers` 为 None 时不创建 `projection` 层），训练时才传入实际说话人数以创建新分类器。
-
-`load_pretrained` 方法使用 `strict=False` 加载，仅过滤掉 `projection.`/`classifier.` 前缀的键名。
-
-### 7.5 优化器与学习率
-
-```python
-backbone_params = [p for n, p in model.named_parameters() if 'classifier' not in n and 'projection' not in n]
-classifier_params = [p for n, p in model.named_parameters() if 'classifier' in n or 'projection' in n]
-
 optimizer = torch.optim.Adam([
-    {'params': backbone_params, 'lr': lr},        # 1e-4
-    {'params': classifier_params, 'lr': lr * 10}, # 1e-3 — 新分类器用更高 lr
+    {'params': backbone_params, 'lr': 1e-4},   # backbone 参数
+    {'params': classifier_params, 'lr': 1e-3},  # 分类头（10× lr）
 ], weight_decay=1e-4)
-
-scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 ```
 
-**策略**: 新分类器参数以 10 倍学习率训练，backbone 微调使用较低学习率。
+- backbone 参数：所有不包含 `classifier` 或 `projection` 的参数
+- classifier 参数：随 num_speakers 变化的分类头参数
+- 分类头学习率是 backbone 的 10 倍，加速新类别适配
 
-### 7.6 损失函数
+### 5.4 学习率调度 (第 981 行)
 
-```python
-criterion = nn.CrossEntropyLoss()
-```
+- `CosineAnnealingLR(optimizer, T_max=epochs)`
+- 从 1e-4（backbone）/ 1e-3（classifier）余弦衰减到 0
 
-标准多分类交叉熵。每个 segment 的标签为对应说话人的 ID，模型输出 `(B, num_speakers)` 分类 logits。
+### 5.5 损失函数
 
-### 7.7 训练循环
+- `CrossEntropyLoss`（标准分类损失）
+
+### 5.6 梯度裁剪 (第 1000 行)
+
+- `clip_grad_norm_(model.parameters(), 5.0)`
+- 防止 RNN/Conv1d 梯度爆炸
+
+### 5.7 训练循环 (第 988 行)
 
 ```
 for epoch in range(epochs):
-    # Train
     model.train()
-    for batch in train_loader:
-        outputs = model(feats)          # 前向
-        loss = criterion(outputs, labels)   # 交叉熵
-        loss.backward()                 # 反向传播
-        clip_grad_norm_(5.0)            # 梯度裁剪 (防梯度爆炸)
-        optimizer.step()                # 参数更新
-    scheduler.step()                    # 余弦退火
-
-    # Validation
-    model.eval()
-    with torch.no_grad():
-        计算验证集 accuracy
-    保存最佳模型 (最高 val acc)
+    for feats, labels in train_loader:
+        optimizer.zero_grad()
+        outputs = model(feats)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        clip_grad_norm_(5.0)
+        optimizer.step()
+    scheduler.step()
+    # Validation + save best model
 ```
 
-- **梯度裁剪**: `max_norm=5.0`，防止低资源微调时的梯度爆炸
-- **余弦退火调度**: 学习率从初始值余弦衰减到 0
-- **早停**: 手动追踪 `best_val_acc`，仅保存超过历史最佳的模型
+### 5.8 验证与模型保存 (第 1010~1053 行)
 
-### 7.8 模型导出
+- 每 epoch 验证，保存 val_acc 最高的模型
+- **三份输出权重:**
+  1. `{model_name}_best.pt` — 验证集最佳 epoch
+  2. `{model_name}_final.pt` — 最后一 epoch（完整含 projection）
+  3. `{model_name}_backbone.pt` — 去掉 projection 后的 backbone（推理用）
 
-```python
-# 完整模型（含分类器）
-torch.save(model.state_dict(), f"{model_name}_final.pt")
+### 5.9 模型版本入库 (第 1074 行)
 
-# Backbone-only（去除分类器，用于部署推理）
-model.cpu()
-del model.classifier  # 或 projection
-torch.save(model.state_dict(), f"{model_name}_backbone.pt")
-```
+训练结束后自动调用 `_register_trained_model()`：
+- 写入 `model_versions` 表
+- 记录：版本标签、嵌入维度、验证准确率、路径、MD5、训练段数和说话人数
 
 ---
 
-## 8. ONNX 推理模型
+## 6. 交互维度对比
 
-生产环境使用 ONNX 模型进行推理，部署在 `app/api/models/`:
-
-| 模型 | ONNX 文件名 | 嵌入维度 |
-|---|---|---|
-| CAM++ | `campplus.onnx` | 192 |
-| ResNet34 | `voxceleb_resnet34_LM.onnx` | 256 |
-| ECAPA | `ecapa-speaker-v1.onnx` | 192 |
-
-**推理流程** (见 `app/api/services/verifier.py`):
-1. 加载音频 → 重采样 16kHz → fbank 提取
-2. ONNX Runtime 推理 → embedding
-3. 缓存 embedding（按 audio_id 或 URL MD5 缓存）
-4. Cosine/欧氏/点积 相似度计算
-5. 阈值决策（CAM++=0.49, ResNet34=0.59, ECAPA=0.68）
+| 特性 | CAM++ | ECAPA-TDNN | ResNet34 |
+|------|-------|------------|----------|
+| 嵌入维度 | 192 | 192 | 256 |
+| 前端处理 | FCM (2D Conv) | Conv1d k=5 | Conv2d k=3×3 |
+| 主体 | DenseTDNN + CAM | SE-Res2Block ×3 | ResNet34 (2D) |
+| 池化 | StatsPool (mean+std) | AttentiveStatsPool | StatsPool (mean+std) |
+| 注意力机制 | CAM (Context-Aware Mask) | SE (Squeeze-Excitation) | 无 |
+| 特征聚合 | Dense concat | MFA (所有 layer concat) | 通道-频域合并 reshape |
+| 参数量（约） | 7.2M | 6.5M | 4.5M |
+| 电话录音表现 | 中等（需低聚类阈值） | 较强（高 sim threshold） | 较强（高 sim threshold） |
+| 坐席判定默认阈值 | 0.49 | 0.68 | 0.59 |
+| 客户聚类默认阈值 | 0.35 | 0.55 | 0.55 |
 
 ---
 
-## 9. 模型版本管理与发布流程
+## 7. 预训练权重加载
 
-**文件**: `app/train/model_manager.py`, `app/train/incremental_train.py`, `app/train/evaluator.py`
-
-### 9.1 发布条件 (`evaluator.should_publish`)
-
-```python
-should_publish(new_eer, prev_eer, improvement_threshold=0.001)
-```
-
-- 首版模型 → 直接发布
-- EER 降低 > 0.001 → 发布
-- 否则跳过
-
-### 9.2 版本编号
-
-```
-get_next_version(conn):
-  active = 'v1.0' → 'v1.1'
-  active = 'v1.1' → 'v1.2'
-```
-
-### 9.3 发布流程 (model_manager.publish_model)
-
-1. 复制 ONNX 到 `api/models/{version}.onnx`
-2. 替换 `api/models/campplus.onnx`（热加载）
-3. 注册数据库记录（含 MD5、EER、训练统计）
-
-### 9.4 评估指标 (evaluator.py)
-
-```python
-compute_eer(scores, labels)       # EER (%) + 对应阈值
-compute_min_dcf(scores, labels,   # minDCF@P_target
-                C_miss=1.0, C_fa=1.0, P_target=0.01)
-```
-
-EER 计算方式：分数降序排列 → 累积 FAR/FRR → 找到 FAR≈FRR 的点。
-
----
-
-## 10. 模型对比 (evaluate.py)
-
-**文件**: `app/train/evaluate.py`
-
-### 10.1 用途
-
-对比 **fine-tune 前（预训练）** 与 **fine-tune 后（微调）** 的 embedding 质量。
-
-### 10.2 核心指标
-
-**Separation = Within-class mean - Between-class mean**
-
-| 指标 | 含义 |
-|---|---|
-| `within['mean']` | 同人段间 cosine 相似度均值 |
-| `between['mean']` | 异人段间 cosine 相似度均值 |
-| `separation` | 两者的差值（越大越好） |
-| `within Δ` | fine-tune 后同人相似度变化（正=改善） |
-| `between Δ` | fine-tune 后异人相似度变化（负=更好区分） |
-
-### 10.3 使用方法
-
-```bash
-PYTHONPATH=. python app/train/evaluate.py --model all --epoch 20
-```
-
-输出示例：
-```
-Model: resnet
-  [Pretrained]  Within=0.6250  Between=0.2316  Separation=0.3934
-  [Fine-tuned] Within=0.7485  Between=0.2212  Separation=0.5273
-  [Delta]      Within Δ=+0.1235  Between Δ=-0.0104  Sep Δ=+0.1339
-```
-
-### 10.4 说话人级别分析
-
-评估同时计算每个说话人的 within-class 相似度变化，并汇总 improve/degrade 计数。
-
----
-
-## 附录: 文件清单
-
-| 文件 | 内容 |
-|---|---|
-| `app/pytorch_models/campp_model.py` | CAM++ 模型定义 + 权重加载 |
-| `app/pytorch_models/resnet34_model.py` | ResNet34 模型定义 + 权重加载 |
-| `app/pytorch_models/ecapa_model.py` | ECAPA-TDNN 模型定义 + 权重加载 |
-| `app/pytorch_models/components.py` | 公共网络层组件 |
-| `app/pytorch_models/verify_weights.py` | 验证三个模型权重加载的测试脚本 |
-| `app/train/fine_tune.py` | 训练主流程（数据加载→训练→导出） |
-| `app/train/evaluate.py` | 前后对比评估脚本 |
-| `app/train/evaluator.py` | EER/minDCF 计算工具 |
-| `app/train/model_manager.py` | 模型版本管理与发布 |
-| `app/train/config.py` | 训练配置加载 |
-| `app/api/services/verifier.py` | 生产环境推理服务 |
+所有模型通过 `_load_backbone()` 加载（第 352 行）：
+1. 如果 key 以 `module.` 开头 → 去掉前缀（兼容 DDP 格式）
+2. 过滤掉 `projection.*` / `classifier.*` key（维度随 num_speakers 变化）
+3. `model.load_state_dict(filtered, strict=False)`
+4. 报告 missing/unexpected keys

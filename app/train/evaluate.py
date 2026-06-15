@@ -22,7 +22,8 @@ from train.fine_tune import (
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-WEIGHTS = Path('pytorch_weights')
+_SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+WEIGHTS = _SCRIPT_DIR.parent / 'pytorch_weights'
 MODELS = {
     'campplus': (CAMPlus, WEIGHTS / 'campplus_cn_common.pt', 192),
     'ecapa':    (ECAPA_TDNNSpeaker, WEIGHTS / 'avg_model.pt', 192),
@@ -244,6 +245,68 @@ def main():
         else:
             logger.info(f'{name:12s} {p["within"]["mean"]:.4f}        N/A             '
                         f'{p["between"]["mean"]:.4f}        N/A             N/A       N/A  N/A')
+
+    # ── Persist evaluation results to SQLite ──
+    _save_eval_results(results)
+    logger.info("Evaluation results saved to model_versions table.")
+
+
+def _save_eval_results(results: Dict) -> None:
+    """Write evaluation results from evaluate.py to model_versions table.
+
+    Each model's stats (within/between similarity, per-speaker breakdown)
+    are stored in the ``metrics`` JSON column.
+    """
+    import json
+    from datetime import datetime as dt
+
+    from train.db import get_connection, insert_model_version, init_db
+
+    conn = get_connection()
+    init_db(conn)
+
+    for name, r in results.items():
+        if r.get('fine_tuned') is None:
+            logger.info("  Skip %s: no fine-tuned model found", name)
+            continue
+
+        name_map = {'campplus': 'CAM++', 'ecapa': 'ECAPA', 'resnet': 'ResNet34'}
+        display_name = name_map.get(name, name)
+        emb_dim = 192 if name != 'resnet' else 256
+
+        sep_delta = r.get('separation_delta', 0.0)
+        improved = r.get('improved', 0)
+        degraded = r.get('degraded', 0)
+
+        metrics = {
+            'eval_type': 'similarity_stats',
+            'pretrained': r['pretrained'],
+            'fine_tuned': r['fine_tuned'],
+            'separation_delta': sep_delta,
+            'improved': improved,
+            'degraded': degraded,
+        }
+
+        tag = dt.now().strftime(f"{name}_eval_%Y%m%d_%H%M%S")
+
+        insert_model_version(
+            conn,
+            model_name=display_name,
+            version_tag=tag,
+            version=tag,
+            embedding_dim=emb_dim,
+            eval_metric='separation_delta',
+            eval_value=sep_delta,
+            improved=True,
+            model_path='',
+            base_model=name,
+            config='{}',
+            metrics=json.dumps(metrics, ensure_ascii=False),
+            notes=f"Evaluate: sep_delta={sep_delta:+.4f}, improved={improved}, degraded={degraded}",
+            score=sep_delta,
+        )
+
+    conn.close()
 
 
 if __name__ == '__main__':

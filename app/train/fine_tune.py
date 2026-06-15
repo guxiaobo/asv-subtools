@@ -760,12 +760,28 @@ def build_training_data() -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
     conn = sqlite3.connect(db_path)
     cursor = conn.execute('SELECT call_id, customer_phone FROM recordings WHERE status=?', ('preprocessed',))
     call_to_customer = {r[0]: r[1] for r in cursor.fetchall()}
+    cursor = conn.execute(
+        "SELECT s.file_path, r.call_id, r.customer_phone "
+        "FROM audio_segments s "
+        "JOIN recordings r ON r.id = s.recording_id "
+        "WHERE s.is_ignored = 0 "
+        "ORDER BY r.call_id, s.segment_index"
+    )
+    segments_by_call: Dict[str, list] = defaultdict(list)
+    for row in cursor.fetchall():
+        segments_by_call[row[1]].append({
+            'file_path': row[0],
+            'customer_phone': row[2],
+        })
     conn.close()
 
-    root = Path(str(PROJECT_ROOT / "data" / "preprocessed" / "collection"))
+    conn.close()
 
-    # For calls with multiple segments: run diarizer once per call to
-    # distinguish agent vs customer segments.
+    # Fallback: if audio_segments is empty (pre-migration data), scan filesystem
+    if not segments_by_call:
+        logger.warning("audio_segments table is empty — falling back to filesystem scan")
+        return _build_training_data_fs(call_to_customer)
+
     from train.diarizer import SpeakerDiarizer
     diarizer = SpeakerDiarizer(model_name="CAM++")
 
@@ -775,48 +791,102 @@ def build_training_data() -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
     id_to_speaker: Dict[int, str] = {}
     next_id = 0
 
+    for call_id, seg_list in sorted(segments_by_call.items()):
+        if call_id in call_to_customer:
+            cust_name = call_to_customer[call_id]
+        else:
+            m = re.match(r'^(.+?)-(\d{10,12})$', call_id)
+            cust_name = m.group(1) if m else call_id
+
+        seg_paths = [s['file_path'] for s in seg_list]
+
+        if len(seg_paths) >= 2:
+            seg_path_objects = [Path(str(PROJECT_ROOT / p)) for p in seg_paths]
+            results = diarizer.diarize(seg_path_objects)
+        else:
+            results = [{'label': 'customer'} for _ in seg_paths]
+
+        for i, r in enumerate(results):
+            label = r.get('label', '')
+            if label != 'customer':
+                continue
+            if cust_name not in speaker_to_id:
+                speaker_to_id[cust_name] = next_id
+                id_to_speaker[next_id] = cust_name
+                next_id += 1
+            sid = speaker_to_id[cust_name]
+            segments.append((str(PROJECT_ROOT / seg_paths[i]), sid))
+            speaker_counter[cust_name] += 1
+
+    logger.info("Training data: %d customer segments, %d speakers",
+                len(segments), len(speaker_to_id))
+    for name in sorted(speaker_to_id.keys(), key=lambda n: speaker_counter[n], reverse=True):
+        logger.info("  %20s: %3d segments", name, speaker_counter[name])
+    logger.info("  (agent segments excluded)")
+    return segments, id_to_speaker
+
+
+def _build_training_data_fs(
+    call_to_customer: Dict[str, str],
+) -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
+    """Fallback: scan filesystem for segment WAVs (pre-migration data).
+
+    Used only when audio_segments table is empty.  Reads from the old
+    preprocessed/collection/<date>/<call_id>/ directory structure.
+    """
+    import re
+    from collections import defaultdict
+    from pathlib import Path
+    from typing import Dict, List, Tuple
+
+    from train.diarizer import SpeakerDiarizer
+
+    root = Path(str(PROJECT_ROOT / "data" / "preprocessed" / "collection"))
+    if not root.exists():
+        logger.info("No preprocessed directory found: %s", root)
+        return [], {}
+
+    speaker_counter: Dict[str, int] = defaultdict(int)
+    segments: List[Tuple[str, int]] = []
+    speaker_to_id: Dict[str, int] = {}
+    id_to_speaker: Dict[int, str] = {}
+    next_id = 0
+    diarizer = SpeakerDiarizer(model_name="CAM++")
+
     for date_dir in sorted(root.iterdir()):
-        if not date_dir.is_dir() or date_dir.name.startswith('.'):
+        if not date_dir.is_dir():
             continue
         for call_dir in sorted(date_dir.iterdir()):
-            if not call_dir.is_dir() or call_dir.name.startswith('.'):
-                continue
-            segs = sorted(call_dir.glob('*_seg*.wav'))
-            if not segs:
-                continue
-
             call_id = call_dir.name
-            # Get customer name from DB or call_id prefix
             if call_id in call_to_customer:
                 cust_name = call_to_customer[call_id]
             else:
-                m = re.match(r'^(.+?)-(\d{10,12})$', call_id)
+                m = re.match(r'^(.+?)-(\\d{10,12})$', call_id)
                 cust_name = m.group(1) if m else call_id
 
-            # Only run diarizer when there are ≥2 segments (need agent vs customer split)
-            if len(segs) >= 2:
-                results = diarizer.diarize(segs)
+            seg_files = sorted(call_dir.glob("*_seg*.wav"))
+            if len(seg_files) < 1:
+                continue
+
+            if len(seg_files) >= 2:
+                results = diarizer.diarize(seg_files)
             else:
-                # Single segment — assume it's customer (fallback to all segments)
-                results = [{'label': 'customer'} for _ in segs]
+                results = [{"label": "customer"} for _ in seg_files]
 
             for i, r in enumerate(results):
-                label = r.get('label', '')
-                if label != 'customer':
-                    continue  # skip agent segments
+                if r.get("label") != "customer" or i >= len(seg_files):
+                    continue
                 if cust_name not in speaker_to_id:
                     speaker_to_id[cust_name] = next_id
                     id_to_speaker[next_id] = cust_name
                     next_id += 1
-                sid = speaker_to_id[cust_name]
-                segments.append((str(segs[i]), sid))
+                segments.append((str(seg_files[i]), speaker_to_id[cust_name]))
                 speaker_counter[cust_name] += 1
 
-    logger.info(f"Training data: {len(segments)} customer segments, "
-                f"{len(speaker_to_id)} speakers")
+    logger.info("Training data (filesystem fallback): %d segments, %d speakers",
+                len(segments), len(speaker_to_id))
     for name in sorted(speaker_to_id.keys(), key=lambda n: speaker_counter[n], reverse=True):
-        logger.info(f"  {name:20s}: {speaker_counter[name]:3d} segments")
-    logger.info(f"  (agent segments excluded)")
+        logger.info("  %20s: %3d segments", name, speaker_counter[name])
     return segments, id_to_speaker
 
 
@@ -984,7 +1054,79 @@ def train_model(model_name: str, epochs: int = 5, lr: float = 1e-4,
 
     logger.info(f"Best val acc: {best_val_acc:.1f}% at epoch {best_epoch}")
     logger.info(f"Training complete for {model_name}")
+
+    # ──8. Register in model_versions table ──────────────────────
+    try:
+        _register_trained_model(
+            model_name=model_name,
+            best_val_acc=best_val_acc,
+            final_path=str(final_path),
+            backbone_path=str(backbone_path),
+            total_segments=len(segments),
+            num_speakers=num_speakers,
+        )
+    except Exception as exc:
+        logger.warning("Model version registration failed (non-fatal): %s", exc)
+
     return best_val_acc
+
+
+def _register_trained_model(
+    model_name: str,
+    best_val_acc: float,
+    final_path: str,
+    backbone_path: str,
+    total_segments: int,
+    num_speakers: int,
+) -> None:
+    """Register a trained model snapshot in model_versions table."""
+    import hashlib
+
+    from train.db import get_connection, insert_model_version, init_db
+
+    conn = get_connection()
+    init_db(conn)
+
+    # Compute version tag
+    from datetime import datetime as dt
+    tag = dt.now().strftime(f"{model_name}_%Y%m%d_%H%M%S")
+
+    # Model name mapping
+    name_map = {
+        "campplus": "CAM++",
+        "ecapa": "ECAPA",
+        "resnet": "ResNet34",
+    }
+    display_name = name_map.get(model_name, model_name)
+
+    # MD5 of final checkpoint
+    md5_hash = None
+    try:
+        md5_hash = hashlib.md5(open(final_path, "rb").read()).hexdigest()
+    except Exception:
+        pass
+
+    insert_model_version(
+        conn,
+        model_name=display_name,
+        version_tag=tag,
+        version=tag,
+        embedding_dim=192 if model_name != "resnet" else 256,
+        eval_metric="val_accuracy",
+        eval_value=best_val_acc,
+        improved=True,
+        train_recording_count=0,    # not tracked per-call here
+        train_speaker_count=num_speakers,
+        train_time_sec=0.0,        # measured externally
+        model_path=final_path,
+        model_md5=md5_hash,
+        base_model=model_name,
+        config="{}",
+        notes=f"Fine-tuned {display_name}: {num_speakers} speakers, {total_segments} segments, val_acc={best_val_acc:.1f}%",
+        score=best_val_acc,
+    )
+    conn.close()
+    logger.info("Model version registered in DB: %s (%s)", display_name, tag)
 
 
 # ===================================================================

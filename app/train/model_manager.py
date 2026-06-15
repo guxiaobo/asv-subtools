@@ -18,6 +18,7 @@ from train.db import (
     deactivate_model,
     get_active_model,
     get_connection,
+    init_db,
     insert_model_version,
 )
 
@@ -158,6 +159,7 @@ def publish_model(
 def register_model_version(
     db_path: str,
     *,
+    model_name: str = "Unknown",
     version: str,
     eval_metric: str,
     eval_value: float,
@@ -178,6 +180,7 @@ def register_model_version(
         新版本的 ID。
     """
     conn = get_connection(db_path)
+    init_db(conn)
 
     # Deactivate current active model
     active = get_active_model(conn)
@@ -190,6 +193,7 @@ def register_model_version(
 
     version_id = insert_model_version(
         conn,
+        model_name=model_name,
         version=version,
         eval_metric=eval_metric,
         eval_value=eval_value,

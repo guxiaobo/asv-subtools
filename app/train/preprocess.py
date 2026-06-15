@@ -33,6 +33,8 @@ from train.db import (
     update_pre_status,
     upsert_voiceprint,
 )
+from data.database import SegmentRepo
+from data.models import AudioSegmentCreate
 from train.config import load_config
 from train.vad import preprocess_recording, get_output_paths
 
@@ -152,6 +154,29 @@ def process_single(
             preprocess_kwargs.setdefault("run_diarization", True)
         result = preprocess_recording(**preprocess_kwargs)
 
+        # ── Write segment metadata to audio_segments table ──
+        segment_details = result.get("segment_details", [])
+        if segment_details:
+            from data.models import AudioSegmentCreate
+
+            seg_repo = SegmentRepo(conn)
+            # Remove old segments for this recording (in case of re-run)
+            seg_repo.delete_by_recording(rec_id)
+            seg_entries = [
+                AudioSegmentCreate(
+                    recording_id=rec_id,
+                    segment_index=i,
+                    file_path=sd["file_path"],
+                    start_sec=sd["start_sec"],
+                    end_sec=sd["end_sec"],
+                    duration_sec=sd["duration_sec"],
+                )
+                for i, sd in enumerate(segment_details)
+            ]
+            seg_repo.insert_batch([s.model_dump() for s in seg_entries])
+        else:
+            logger.warning("No segment_details in result (writing zero segments)")
+
         update_pre_status(conn, rec_id, "done", pre_result=result)
         logger.info(
             "Done: id=%d call=%s segments=%d",
@@ -229,34 +254,27 @@ def _cross_call_aggregate_phase(
     )
 
     # 构建 calls_by_customer 结构
-    calls_by_customer = {}
+    calls_by_customer: dict = {}
     skipped = 0
 
     for cust_id, rec_list in by_customer.items():
         calls_info = []
         for rec in rec_list:
-            # 定位 VAD 段文件目录
-            biz = rec["biz_system"] or "collection"
-            ts = rec["call_timestamp"] or ""
-            date_str = ts[:10] if ts else "unknown"
-            call_id = rec["call_id"]
-            seg_dir = Path(preprocessed_root) / biz / date_str / call_id
-            if not seg_dir.exists():
-                # 尝试其他日期目录
-                alt_dirs = list(Path(preprocessed_root).rglob(call_id))
-                if alt_dirs:
-                    seg_dir = alt_dirs[0]
-                else:
-                    skipped += 1
-                    continue
-
-            seg_files = sorted(seg_dir.glob("*_seg*.wav"))
-            if not seg_files:
+            rec_id = rec["id"]
+            # Query audio_segments table instead of filesystem glob
+            seg_rows = conn.execute(
+                "SELECT id, file_path FROM audio_segments "
+                "WHERE recording_id = ? AND is_ignored = 0 "
+                "ORDER BY segment_index",
+                (rec_id,),
+            ).fetchall()
+            if not seg_rows:
                 skipped += 1
                 continue
 
+            seg_files = [Path(r["file_path"]) for r in seg_rows]
             calls_info.append({
-                "call_id": call_id,
+                "call_id": rec["call_id"],
                 "segment_files": seg_files,
             })
 
@@ -273,8 +291,13 @@ def _cross_call_aggregate_phase(
     # 对每通录音先跑一遍 diarize（逐通标注），收集结果
     for cust_id, calls_info in calls_by_customer.items():
         for call_info in calls_info:
-            results = diarizer.diarize(call_info["segment_files"])
-            call_info["diarize_results"] = results
+            try:
+                results = diarizer.diarize(call_info["segment_files"])
+                call_info["diarize_results"] = results
+            except Exception as e:
+                logger.warning("跨录音聚合阶段 diarize 失败: call=%s %s — 跳过该通",
+                               call_info.get("call_id", "?"), e)
+                call_info["diarize_results"] = []
 
     # 跨录音聚合
     aggregated = diarizer.cross_call_aggregate(calls_by_customer)
@@ -415,8 +438,8 @@ def main() -> None:
         conn.close()
         return
 
-    # One-shot mode
-    rows = claim_pending_recordings(conn, limit=args.limit or 0)
+    # One-shot mode (default batch size = 50)
+    rows = claim_pending_recordings(conn, limit=args.limit or 50)
     logger.info("领取到 %d 条录音进行处理", len(rows))
 
     success = 0

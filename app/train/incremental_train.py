@@ -226,6 +226,7 @@ def main() -> None:
     # ──── STEP 5: Register in SQLite ───────────────────────────────────────
     register_model_version(
         db_path,
+        model_name=model_cfg.get("backbone", "CAM++"),
         version=version,
         eval_metric="EER",
         eval_value=new_eer,

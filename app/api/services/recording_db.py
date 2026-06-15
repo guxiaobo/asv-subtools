@@ -28,65 +28,26 @@ def _get_default_db_path() -> Path:
 # ---------------------------------------------------------------------------
 
 async def init_db(db_path: Optional[str] = None) -> None:
-    """
-    初始化 SQLite 数据库（建表 + 优化 pragma）。
-    应用启动时调用一次，完成后关闭连接。
-
-    Args:
-        db_path: 数据库文件路径，None 则使用默认路径。
-    """
+    """Initialize database using unified DDL from data.database (shared with train layer)."""
     import aiosqlite
 
     path = Path(db_path) if db_path else _get_default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(str(path)) as conn:
-        # Pragma 只在此初始化，后续每个连接会单独设置
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA synchronous=NORMAL")
         await conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = aiosqlite.Row
 
-        # Create tables
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS recordings (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                biz_system      TEXT    NOT NULL,
-                call_id         TEXT    NOT NULL UNIQUE,
-                agent_id        TEXT    NOT NULL,
-                customer_phone  TEXT    NOT NULL,
-                call_timestamp  TEXT    NOT NULL,
-                channel_separated INTEGER DEFAULT 0,
-                duration_sec    REAL,
-                audio_source_type TEXT  NOT NULL,
-                audio_original_url TEXT,
-                local_audio_path    TEXT,
-                file_hash       TEXT,
-                status          TEXT    NOT NULL DEFAULT 'raw',
-                pre_status      TEXT    DEFAULT 'pending',
-                pre_result      TEXT,
-                pre_error       TEXT,
-                pre_finished_at TEXT,
-                train_status    TEXT    DEFAULT 'pending',
-                train_result    TEXT,
-                train_error     TEXT,
-                train_finished_at TEXT,
-                model_version   TEXT,
-                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
+        from data.database import init_schema_async
+        await init_schema_async(conn)
 
-        # Add file_hash column for existing databases (safe IF NOT EXISTS)
-        for alter_stmt in [
-            "ALTER TABLE recordings ADD COLUMN file_hash TEXT",
-        ]:
-            try:
-                await conn.execute(alter_stmt)
-            except Exception:
-                pass  # Column already exists
-
-        # Unique index for fast duplicate detection by hash
+        # file_hash column fallback (pre-migration DBs)
+        try:
+            await conn.execute("ALTER TABLE recordings ADD COLUMN file_hash TEXT")
+        except Exception:
+            pass
         try:
             await conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_recordings_file_hash "
@@ -94,76 +55,24 @@ async def init_db(db_path: Optional[str] = None) -> None:
             )
         except Exception:
             pass
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS model_versions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                version         TEXT    NOT NULL UNIQUE,
-                eval_metric     TEXT    NOT NULL,
-                eval_value      REAL    NOT NULL,
-                prev_eval_value REAL,
-                improved        INTEGER DEFAULT 0,
-                train_recording_count INTEGER NOT NULL,
-                train_speaker_count   INTEGER NOT NULL,
-                train_time_sec   REAL,
-                previous_version TEXT,
-                model_path      TEXT    NOT NULL,
-                model_md5       TEXT,
-                is_active       INTEGER DEFAULT 0,
-                notes           TEXT,
-                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+
+        # Legacy model_versions migration
+        try:
+            rows = await conn.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='model_versions'"
             )
-        """)
+            if rows:
+                pragma = await conn.execute_fetchall("PRAGMA table_info(model_versions)")
+                col_names = {r[1] for r in pragma}
+                if "version" in col_names and "model_name" not in col_names:
+                    await conn.execute("ALTER TABLE model_versions RENAME TO model_versions_legacy")
+                    from data.database import DDL_TABLES
+                    await conn.execute(DDL_TABLES["model_versions"])
+                    logger.info("Schema migration: legacy model_versions renamed to model_versions_legacy")
+        except Exception as exc:
+            logger.warning("Schema migration check failed: %s", exc)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS speaker_voiceprints (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_name      TEXT    NOT NULL,
-                speaker_type    TEXT    NOT NULL,
-                speaker_id      TEXT    NOT NULL,
-                embedding       BLOB    NOT NULL,
-                segment_count   INTEGER DEFAULT 1,
-                source_call_ids TEXT,
-                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-
-        for idx_stmt in [
-            "CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status)",
-            "CREATE INDEX IF NOT EXISTS idx_recordings_pre_status ON recordings(pre_status)",
-            "CREATE INDEX IF NOT EXISTS idx_recordings_train_status ON recordings(train_status)",
-            "CREATE INDEX IF NOT EXISTS idx_recordings_biz_agent ON recordings(biz_system, agent_id)",
-            "CREATE INDEX IF NOT EXISTS idx_model_versions_active ON model_versions(is_active)",
-        ]:
-            try:
-                await conn.execute(idx_stmt)
-            except Exception:
-                pass
-
-        # ── Users table (auth) ────────────────────────────────────────
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                username        TEXT    NOT NULL UNIQUE,
-                password_hash   TEXT    NOT NULL,
-                role            TEXT    NOT NULL DEFAULT 'agent'
-                                        CHECK (role IN ('admin','model_manager','agent')),
-                agent_id        TEXT    NOT NULL DEFAULT '',
-                display_name    TEXT    NOT NULL DEFAULT '',
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-
-        await conn.commit()
-
-    logger.info("Recording DB schema initialized: %s", path)
-
-
-# ---------------------------------------------------------------------------
-# Connection helpers (per-request)
-# ---------------------------------------------------------------------------
-
+        logger.info("Database schema initialized: %s", path)
 async def _open_conn(db_path: Optional[str] = None) -> "aiosqlite.Connection":
     """打开一个新的独立数据库连接。"""
     import aiosqlite
@@ -571,5 +480,394 @@ async def get_users_by_role(
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+# Audio Segment CRUD
+# ---------------------------------------------------------------------------
+
+async def get_segments_by_recording(
+    recording_id: int,
+    batch_id: str = "",
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """获取指定录音的所有断句片段。"""
+    conn = await _open_conn(db_path)
+    try:
+        if batch_id:
+            cursor = await conn.execute(
+                "SELECT * FROM audio_segments "
+                "WHERE recording_id = ? AND batch_id = ? ORDER BY segment_index ASC",
+                (recording_id, batch_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM audio_segments "
+                "WHERE recording_id = ? ORDER BY batch_id DESC, segment_index ASC",
+                (recording_id,),
+            )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+        await conn.close()
+
+
+async def get_latest_batch_for_recording(
+    recording_id: int,
+    db_path: Optional[str] = None,
+) -> str:
+    """获取录音最新的断句 batch_id。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT batch_id FROM audio_segments "
+            "WHERE recording_id = ? ORDER BY id DESC LIMIT 1",
+            (recording_id,),
+        )
+        row = await cursor.fetchone()
+        return row["batch_id"] if row else ""
+    finally:
+        await conn.close()
+
+
+async def insert_segment(
+    *,
+    recording_id: int,
+    segment_index: int,
+    batch_id: str,
+    file_path: str,
+    start_sec: float = 0,
+    end_sec: float = 0,
+    duration_sec: float = 0,
+    db_path: Optional[str] = None,
+) -> int:
+    """插入一条断句记录。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "INSERT INTO audio_segments "
+            "(recording_id, segment_index, batch_id, file_path, start_sec, end_sec, duration_sec) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (recording_id, segment_index, batch_id, file_path, start_sec, end_sec, duration_sec),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def update_segment_label(
+    seg_id: int,
+    *,
+    speaker_label: str = "",
+    speaker_type: str = "",
+    label_source: str = "",
+    db_path: Optional[str] = None,
+) -> bool:
+    """更新片段的说话人标签信息。"""
+    conn = await _open_conn(db_path)
+    try:
+        updates = []
+        params = []
+        if speaker_label:
+            updates.append("speaker_label = ?")
+            params.append(speaker_label)
+        if speaker_type:
+            updates.append("speaker_type = ?")
+            params.append(speaker_type)
+        if label_source:
+            updates.append("label_source = ?")
+            params.append(label_source)
+        if not updates:
+            return False
+        params.append(seg_id)
+        await conn.execute(
+            f"UPDATE audio_segments SET {', '.join(updates)} WHERE id = ?", params
+        )
+        await conn.commit()
+        return True
+    finally:
+        await conn.close()
+
+
+async def set_segment_ignored(
+    seg_id: int,
+    ignored: bool = True,
+    db_path: Optional[str] = None,
+) -> bool:
+    """设置片段是否忽略。"""
+    conn = await _open_conn(db_path)
+    try:
+        await conn.execute(
+            "UPDATE audio_segments SET is_ignored = ? WHERE id = ?",
+            (1 if ignored else 0, seg_id),
+        )
+        await conn.commit()
+        return True
+    finally:
+        await conn.close()
+
+
+async def count_pending_segment_recordings(
+    db_path: Optional[str] = None,
+) -> int:
+    """统计尚未断句的录音数量。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings r "
+            "WHERE pre_status = 'done' AND NOT EXISTS ("
+            "  SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id"
+            ")"
+        )
+        row = await cursor.fetchone()
+        return row["cnt"]
+    finally:
+        await conn.close()
+
+
+async def get_batches_for_recording(
+    recording_id: int,
+    db_path: Optional[str] = None,
+) -> List[str]:
+    """获取录音的所有断句 batch_id 列表。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT DISTINCT batch_id FROM audio_segments "
+            "WHERE recording_id = ? ORDER BY batch_id ASC",
+            (recording_id,),
+        )
+        return [row["batch_id"] for row in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def list_recordings_with_segments(
+    agent_id: str = "",
+    customer_phone: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    status_filter: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """查询带有断句信息的录音列表（用于模型管理员页面展示）。"""
+    conditions = ["1=1"]
+    params: List[Any] = []
+
+    if agent_id:
+        conditions.append("r.agent_id = ?")
+        params.append(agent_id)
+    if customer_phone:
+        conditions.append("r.customer_phone = ?")
+        params.append(customer_phone)
+    if date_from:
+        conditions.append("r.call_timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("r.call_timestamp <= ?")
+        params.append(date_to + " 23:59:59")
+    if status_filter == "pending_segment":
+        conditions.append("r.pre_status = 'done'")
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
+        )
+    elif status_filter == "segmented":
+        conditions.append(
+            "EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
+        )
+    elif status_filter:
+        conditions.append("r.pre_status = ?")
+        params.append(status_filter)
+
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            f"SELECT r.*, "
+            f"(SELECT COUNT(*) FROM audio_segments s WHERE s.recording_id = r.id) AS seg_count, "
+            f"(SELECT COUNT(*) FROM audio_segments s WHERE s.recording_id = r.id AND s.is_ignored = 1) AS seg_ignored, "
+            f"(SELECT s2.batch_id FROM audio_segments s2 WHERE s2.recording_id = r.id ORDER BY s2.id DESC LIMIT 1) AS latest_batch "
+            f"FROM recordings r WHERE {' AND '.join(conditions)} "
+            f"ORDER BY r.id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Model Versions — training version metadata
+# --------...[truncated]# but heredocs aren't working...
+
+
+
+# ---------------------------------------------------------------------------
+# Model Versions — training version metadata
+# ---------------------------------------------------------------------------
+
+async def list_model_versions(model_name: str = "", limit: int = 50, offset: int = 0):
+    """列出所有模型训练版本。"""
+    conn = await _open_conn()
+    try:
+        params: list = []
+        where = ""
+        if model_name:
+            where = "WHERE model_name = ?"
+            params.append(model_name)
+        cursor = await conn.execute(
+            f"SELECT * FROM model_versions {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def create_model_version(model_name: str, version_tag: str, base_model: str,
+                               embedding_dim: int, config: str = "{}",
+                               metrics: str = "{}", score: float = None,
+                               status: str = "training"):
+    """创建新的模型版本记录。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO model_versions 
+               (model_name, version_tag, base_model, embedding_dim, config, 
+                metrics, score, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))""",
+            (model_name, version_tag, base_model, embedding_dim,
+             config, metrics, score, status),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def update_model_version(version_id: int, **kwargs):
+    """更新模型版本记录的字段。"""
+    allowed = {"status", "metrics", "score", "config", "version_tag"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed}
+    if not updates:
+        return
+    conn = await _open_conn()
+    try:
+        set_clauses = []
+        params = []
+        for k, v in updates.items():
+            set_clauses.append(f"{k} = ?")
+            params.append(v)
+        params.append(version_id)
+        await conn.execute(
+            f"UPDATE model_versions SET {', '.join(set_clauses)} WHERE id = ?",
+            params,
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def get_published_version(model_name: str):
+    """获取当前发布的模型版本。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM model_versions WHERE model_name = ? AND status = 'published' ORDER BY id DESC LIMIT 1",
+            (model_name,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def get_version_diff(version_a_id: int, version_b_id: int):
+    """获取两个版本的对比详情。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM model_versions WHERE id IN (?, ?)", (version_a_id, version_b_id)
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        return rows
+    finally:
+        await conn.close()
+
+
+async def count_pending_training():
+    """统计待训练的录音数。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'done' AND train_status != 'done'"
+        )
+        row = await cursor.fetchone()
+        return row[0]
+    finally:
+        await conn.close()
+
+
+async def list_checkpoints(model_name: str = "", limit: int = 100):
+    """列出所有 checkpoints。"""
+    conn = await _open_conn()
+    try:
+        params: list = []
+        where = ""
+        if model_name:
+            where = "WHERE model_name = ?"
+            params.append(model_name)
+        cursor = await conn.execute(
+            f"SELECT * FROM checkpoints {where} ORDER BY id DESC LIMIT ?",
+            params + [limit],
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def add_checkpoint(model_name: str, version_tag: str, file_path: str,
+                         file_size: int = 0, embedding_dim: int = 192,
+                         metrics: str = "{}"):
+    """添加 checkpoint 记录。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO checkpoints 
+               (model_name, version_tag, file_path, file_size, embedding_dim,
+                metrics, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))""",
+            (model_name, version_tag, file_path, file_size, embedding_dim, metrics),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def set_published_checkpoint(checkpoint_id: int):
+    """发布指定 checkpoint（取消该模型其他已发布检查点）。"""
+    conn = await _open_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT model_name FROM checkpoints WHERE id = ?", (checkpoint_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False
+        model_name = row["model_name"]
+        await conn.execute(
+            "UPDATE checkpoints SET is_published = 0 WHERE model_name = ?",
+            (model_name,),
+        )
+        await conn.execute(
+            "UPDATE checkpoints SET is_published = 1 WHERE id = ?",
+            (checkpoint_id,),
+        )
+        await conn.commit()
+        return True
     finally:
         await conn.close()

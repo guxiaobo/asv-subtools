@@ -175,11 +175,12 @@ def require_role(*roles: str):
     """FastAPI 依赖工厂：要求用户具有指定角色之一。"""
     async def _check(request: Request) -> Dict[str, Any]:
         user = await get_current_user(request)
-        if user.get("role") not in roles:
+        if user is None or user.get("role") not in roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="权限不足",
             )
+        request.state.current_user = user
         return user
     return _check
 

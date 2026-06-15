@@ -126,6 +126,7 @@
 
 <script>
 let selectedFile = null;
+const LOGGED_AGENT_ID = "{{ user.get('agent_id','') }}";
 
 function onFileSelect(event) {
     selectedFile = event.target.files[0];
@@ -219,7 +220,16 @@ async function uploadFile(event) {
     fill.style.width = '30%';
 
     const formData = new FormData();
-    formData.append('agent_id', '');  // 通过文件名自动解析
+    
+    // 从文件名解析或使用当前登录坐席 ID
+    const nameNoExt = selectedFile.name.replace(/\.[^.]+$/, '');
+    const parts = nameNoExt.split('-');
+    let agentId = LOGGED_AGENT_ID;
+    if (parts.length === 3) {
+        agentId = parts[0];  // 3段式：从文件名提取坐席ID
+    }
+    // 2段式：自动使用当前登录坐席的 ID
+    formData.append('agent_id', agentId);
     formData.append('biz_system', 'agent_upload');
     formData.append('audio_data', selectedFile);
 

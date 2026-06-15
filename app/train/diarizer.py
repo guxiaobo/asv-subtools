@@ -515,10 +515,10 @@ class SpeakerDiarizer:
             otsu_t = self.agent_threshold
             logger.debug("Otsu 不可用 (%d 有效段)，fallback 阈值=%.2f", len(valid_sims_clean), otsu_t)
 
+        sim_range = f"sim 范围 {min(valid_sims_clean):.3f}~{max(valid_sims_clean):.3f}" if valid_sims_clean else "全部 None"
         logger.info(
-            "Otsu 分割阈值=%.3f (基于 %d 段, sim 范围 %.3f~%.3f)",
-            otsu_t, len(valid_sims_clean),
-            min(valid_sims_clean), max(valid_sims_clean),
+            "Otsu 分割阈值=%.3f (基于 %d 段, %s)",
+            otsu_t, len(valid_sims_clean), sim_range,
         )
 
         # 按 Otsu 阈值分割：低 sim → 客户候选, 高 sim → 坐席
@@ -1032,22 +1032,44 @@ def main():
 
     # Find segment WAV files
     if args.target_dir:
+        # Power user: scan any directory directly
         seg_files = sorted(Path(args.target_dir).rglob("*_seg*.wav"))
+
+        logger.info("共找到 %d 个段文件（通过目录扫描）", len(seg_files))
+        if not seg_files:
+            return
+
+        # Group by call (parent directory = call directory)
+        from collections import defaultdict
+        call_groups = defaultdict(list)
+        for f in seg_files:
+            call_dir = f.parent
+            call_groups[str(call_dir)].append(f)
     else:
-        # Default: scan data/preprocessed
-        root = Path(__file__).resolve().parent.parent / "data" / "preprocessed"
-        seg_files = sorted(root.rglob("*_seg*.wav"))
+        # Default: query audio_segments table (no filesystem traversal)
+        project_root = Path(__file__).resolve().parent.parent
+        db_path = args.db_path or str(project_root / "data" / "training.db")
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT s.file_path, r.call_id "
+            "FROM audio_segments s "
+            "JOIN recordings r ON r.id = s.recording_id "
+            "WHERE s.is_ignored = 0 "
+            "ORDER BY r.call_id, s.segment_index"
+        ).fetchall()
+        conn.close()
 
-    logger.info("共找到 %d 个段文件", len(seg_files))
-    if not seg_files:
-        return
+        call_groups: dict = {}
+        for row in rows:
+            call_id = row[1]
+            file_path = str(Path(row[0]).resolve())
+            call_groups.setdefault(call_id, []).append(Path(file_path))
 
-    # Group by call (parent directory = call directory)
-    from collections import defaultdict
-    call_groups = defaultdict(list)
-    for f in seg_files:
-        call_dir = f.parent
-        call_groups[str(call_dir)].append(f)
+        logger.info("共从 DB 加载 %d 个段文件（%d 组）",
+                     sum(len(v) for v in call_groups.values()), len(call_groups))
+        if not call_groups:
+            return
 
     print(f"\n{'='*60}")
     print(f"Diarizer 分析结果（优化版）")

@@ -11,6 +11,7 @@
         .navbar h2 { font-size: 18px; }
         .nav-links a { color: #94a3b8; text-decoration: none; margin-left: 20px; font-size: 14px; }
         .nav-links a:hover { color: white; }
+        .nav-links a.active { color: white; font-weight: bold; }
         .container { max-width: 1200px; margin: 0 auto; padding: 24px 16px; }
         .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .card h3 { font-size: 18px; color: #1e293b; margin-bottom: 16px; }
@@ -64,6 +65,8 @@
     <h2>🔊 ASV 模型管理</h2>
     <div class="nav-links">
         <a href="/model-manager">首页</a>
+        <a href="/model-manager/segments">录音断句</a>
+        <a href="/model-manager/vad-config">VAD 参数</a>
         <a href="/change-password">修改密码</a>
         <a href="/logout">注销</a>
     </div>
