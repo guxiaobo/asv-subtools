@@ -218,6 +218,8 @@ async def admin_dashboard(request: Request):
     if user["role"] != ROLE_ADMIN:
         return RedirectResponse(url=_home_redirect(user["role"]), status_code=302)
     users = await list_users()
+    from services.recording_db import get_multi_period_call_stats
+    call_stats = await get_multi_period_call_stats()
     return templates.TemplateResponse(
         "admin_users.html",
         {
@@ -225,6 +227,7 @@ async def admin_dashboard(request: Request):
             "user": user,
             "users": users,
             "roles": ROLE_LABELS,
+            "call_stats": call_stats,
         },
     )
 
@@ -353,28 +356,33 @@ async def model_manager_dashboard(
     if user["role"] != ROLE_MODEL_MANAGER:
         return RedirectResponse(url=_home_redirect(user["role"]), status_code=302)
 
-    kwargs = dict(limit=200)
-    if status_filter:
-        kwargs["status"] = status_filter
+    from services.recording_db import get_dashboard_stats, get_multi_period_call_stats
+    stats = await get_dashboard_stats()
+    call_stats = await get_multi_period_call_stats()
 
-    recordings = await list_recordings(**kwargs)
-
-    from services.recording_db import count_pending_preprocess, count_pending_train
-
-    pending_pre = await count_pending_preprocess()
-    pending_train = await count_pending_train()
+    # 格式化运行时长
+    uptime_sec = stats["uptime_sec"]
+    hours, rem = divmod(int(uptime_sec), 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 24:
+        days = hours // 24
+        hours = hours % 24
+        uptime_str = f"{days}天{hours}小时{minutes}分"
+    elif hours > 0:
+        uptime_str = f"{hours}小时{minutes}分"
+    else:
+        uptime_str = f"{minutes}分{seconds}秒"
 
     return templates.TemplateResponse(
         "model_manager_home.html",
         {
             "request": request,
             "user": user,
-            "recordings": recordings,
-            "pending_preprocess": pending_pre,
-            "pending_train": pending_train,
+            "stats": stats,
+            "uptime_str": uptime_str,
+            "call_stats": call_stats,
             "error": err,
             "ok": ok,
-            "status_filter": status_filter,
         },
     )
 

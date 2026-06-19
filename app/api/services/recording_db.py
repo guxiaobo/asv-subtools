@@ -871,3 +871,246 @@ async def set_published_checkpoint(checkpoint_id: int):
         return True
     finally:
         await conn.close()
+
+
+async def get_dashboard_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """获取首页仪表盘统计（单连接批量查询）。"""
+    import time as time_module
+    import psutil
+
+    conn = await _open_conn(db_path)
+    try:
+        stats: Dict[str, Any] = {}
+
+        # ── 录音信息 ──
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'pending'"
+        )
+        stats["pending_vad"] = (await cur.fetchone())["cnt"]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings "
+            "WHERE created_at >= datetime('now', '-7 days')"
+        )
+        stats["new_7d"] = (await cur.fetchone())["cnt"]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'done'"
+        )
+        stats["segmented_recordings"] = (await cur.fetchone())["cnt"]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE is_ignored IS NULL OR is_ignored = 0"
+        )
+        stats["total_segments"] = (await cur.fetchone())["cnt"]
+
+        # ── 说话人信息 ──
+        cur = await conn.execute(
+            "SELECT COUNT(DISTINCT speaker_label) AS cnt FROM audio_segments "
+            "WHERE speaker_label IS NOT NULL AND speaker_label != '' "
+            "AND (is_ignored IS NULL OR is_ignored = 0)"
+        )
+        stats["labeled_speakers"] = (await cur.fetchone())["cnt"]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE speaker_label IS NOT NULL AND speaker_label != '' "
+            "AND (is_ignored IS NULL OR is_ignored = 0)"
+        )
+        stats["labeled_segments"] = (await cur.fetchone())["cnt"]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE (speaker_label IS NULL OR speaker_label = '') "
+            "AND (is_ignored IS NULL OR is_ignored = 0)"
+        )
+        stats["unlabeled_segments"] = (await cur.fetchone())["cnt"]
+
+        # ── 模型信息 ──
+        cur = await conn.execute(
+            "SELECT model_name, COUNT(*) AS version_count "
+            "FROM checkpoints GROUP BY model_name ORDER BY model_name"
+        )
+        db_models = {r["model_name"]: r["version_count"] for r in await cur.fetchall()}
+
+        # Also scan filesystem for physically present model files
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+        fs_models: dict = {}
+        if os.path.isdir(models_dir):
+            for fname in os.listdir(models_dir):
+                if fname.endswith((".onnx", ".pt", ".pth", ".bin", ".gguf")):
+                    # Strip extension, extract meaningful name
+                    name = os.path.splitext(fname)[0]
+                    if name not in fs_models:
+                        fs_models[name] = 0
+                    fs_models[name] += 1
+
+        # Merge: filesystem models always shown; DB adds version_count info
+        all_model_names = sorted(set(list(db_models.keys()) + list(fs_models.keys())))
+        merged = []
+        for name in all_model_names:
+            merged.append({
+                "model_name": name,
+                "version_count": db_models.get(name, 0),
+            })
+        stats["models"] = merged
+        stats["total_models"] = len(merged)
+
+        # Also list the raw fs files for diagnostics
+        stats["fs_model_files"] = sorted(
+            [f for f in (os.listdir(models_dir) if os.path.isdir(models_dir) else [])
+             if f.endswith((".onnx", ".pt", ".pth", ".bin", ".gguf"))]
+        )
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments s "
+            "JOIN recordings r ON s.recording_id = r.id "
+            "WHERE r.pre_status = 'done' "
+            "AND (r.train_status IS NULL OR r.train_status NOT IN ('done','training')) "
+            "AND (s.is_ignored IS NULL OR s.is_ignored = 0)"
+        )
+        stats["pending_train_segments"] = (await cur.fetchone())["cnt"]
+
+        # ── 系统运行时 ──
+        p = psutil.Process()
+        stats["uptime_sec"] = time_module.time() - p.create_time()
+        stats["memory_mb"] = round(p.memory_info().rss / 1024 / 1024, 1)
+        stats["thread_count"] = p.num_threads()
+        stats["cpu_percent"] = p.cpu_percent(interval=0.1)
+
+        return stats
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# API Call Logging — real-time call tracking
+# ---------------------------------------------------------------------------
+
+
+async def log_api_call(
+    *,
+    endpoint: str,
+    audio_a_source: str,
+    audio_a_value: str = "",
+    audio_b_source: str,
+    audio_b_value: str = "",
+    has_audio_data: bool = False,
+    duration_ms: Optional[int] = None,
+    score: Optional[float] = None,
+    decision: Optional[str] = None,
+    threshold: Optional[float] = None,
+    scenario: Optional[str] = None,
+    caller_ip: Optional[str] = None,
+    error_detail: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> int:
+    """记录一次 API 调用日志。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO api_call_logs
+               (endpoint, audio_a_source, audio_a_value, audio_b_source,
+                audio_b_value, has_audio_data, duration_ms, score,
+                decision, threshold, scenario, caller_ip, error_detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                endpoint,
+                audio_a_source,
+                audio_a_value,
+                audio_b_source,
+                audio_b_value,
+                1 if has_audio_data else 0,
+                duration_ms,
+                score,
+                decision,
+                threshold,
+                scenario,
+                caller_ip,
+                error_detail,
+            ),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def get_api_call_stats(days: int = 1, db_path: Optional[str] = None) -> dict:
+    """获取最近 N 天的 API 调用统计。
+
+    Returns:
+        dict with keys: total_calls, avg_duration_ms, max_duration_ms,
+        p50_ms, p95_ms, success_count, fail_count
+    """
+    conn = await _open_conn(db_path)
+    try:
+        import sqlite3
+
+        result: dict = {
+            "total_calls": 0,
+            "avg_duration_ms": 0,
+            "max_duration_ms": 0,
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "success_count": 0,
+            "fail_count": 0,
+        }
+
+        cur = await conn.execute(
+            "SELECT COUNT(*), COALESCE(AVG(duration_ms),0), "
+            "COALESCE(MAX(duration_ms),0) "
+            "FROM api_call_logs "
+            "WHERE created_at >= datetime('now', ? || ' days', 'localtime')",
+            (f"-{days}",),
+        )
+        row = await cur.fetchone()
+        result["total_calls"] = row[0]
+        result["avg_duration_ms"] = round(row[1], 1) if row[1] else 0
+        result["max_duration_ms"] = row[2] or 0
+
+        # success/fail (where score IS NOT NULL = success)
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM api_call_logs "
+            "WHERE created_at >= datetime('now', ? || ' days', 'localtime') "
+            "AND score IS NOT NULL",
+            (f"-{days}",),
+        )
+        result["success_count"] = (await cur.fetchone())[0]
+
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM api_call_logs "
+            "WHERE created_at >= datetime('now', ? || ' days', 'localtime') "
+            "AND error_detail IS NOT NULL",
+            (f"-{days}",),
+        )
+        result["fail_count"] = (await cur.fetchone())[0]
+
+        # Percentiles via subquery with sorting
+        cur = await conn.execute(
+            "SELECT duration_ms FROM api_call_logs "
+            "WHERE created_at >= datetime('now', ? || ' days', 'localtime') "
+            "AND duration_ms IS NOT NULL ORDER BY duration_ms",
+            (f"-{days}",),
+        )
+        values = [r[0] for r in await cur.fetchall()]
+        if values:
+            n = len(values)
+            idx50 = max(0, int(n * 0.5) - 1)
+            idx95 = max(0, int(n * 0.95) - 1)
+            result["p50_ms"] = values[idx50]
+            result["p95_ms"] = values[idx95]
+
+        return result
+    finally:
+        await conn.close()
+
+
+async def get_multi_period_call_stats(db_path: Optional[str] = None) -> dict:
+    """获取多维 API 调用统计（当天 / 7天 / 30天）。"""
+    return {
+        "today": await get_api_call_stats(1, db_path),
+        "last_7d": await get_api_call_stats(7, db_path),
+        "last_30d": await get_api_call_stats(30, db_path),
+    }

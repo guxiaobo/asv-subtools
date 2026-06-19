@@ -39,8 +39,8 @@ logger = logging.getLogger("train.fine_tune")
 # 路径
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # app/
-WEIGHTS_DIR = PROJECT_ROOT / "pytorch_weights"
-OUTPUT_DIR = WEIGHTS_DIR / "fine_tuned"
+WEIGHTS_DIR = PROJECT_ROOT / "model_data" / "checkpoints"
+OUTPUT_DIR = PROJECT_ROOT / "model_data" / "checkpoints"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # FBank 配置
@@ -911,14 +911,20 @@ def train_model(model_name: str, epochs: int = 5, lr: float = 1e-4,
     ckpt_path = None
 
     if model_name == "campplus":
-        ckpt_path = WEIGHTS_DIR / "campplus_cn_common.pt"
+        ckpt_path = WEIGHTS_DIR / "CAM++" / "v0_pretrained" / "model.pt"
+        if not ckpt_path.exists():
+            ckpt_path = PROJECT_ROOT / "pytorch_weights" / "campplus_cn_common.pt"
         model = CAMPlus(feat_dim=80, embedding_dim=192, num_speakers=num_speakers)
     elif model_name == "ecapa":
-        ckpt_path = WEIGHTS_DIR / "avg_model.pt"
+        ckpt_path = WEIGHTS_DIR / "ECAPA" / "v0_pretrained" / "model.pt"
+        if not ckpt_path.exists():
+            ckpt_path = PROJECT_ROOT / "pytorch_weights" / "avg_model.pt"
         model = ECAPA_TDNNSpeaker(feat_dim=80, embedding_dim=192,
                                   num_speakers=num_speakers)
     elif model_name == "resnet":
-        ckpt_path = WEIGHTS_DIR / "avg_model"
+        ckpt_path = WEIGHTS_DIR / "ResNet34" / "v0_pretrained" / "model.pt"
+        if not ckpt_path.exists():
+            ckpt_path = PROJECT_ROOT / "pytorch_weights" / "avg_model"
         model = ResNet34_2D(feat_dim=80, embedding_dim=256,
                             num_speakers=num_speakers)
 

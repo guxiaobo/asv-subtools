@@ -25,9 +25,11 @@ router = APIRouter()
 logger = logging.getLogger("model_manager_router")
 
 # Project root (two levels up from this router file)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES_DIR = PROJECT_ROOT / "templates"
-DATA_DIR = PROJECT_ROOT / "data"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # asv-subtools/
+APP_DIR = PROJECT_ROOT / "app"
+TEMPLATES_DIR = APP_DIR / "api" / "templates"
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "training.db"
 VAD_CONFIG_PATH = DATA_DIR / "vad_config.json"
 
 # Default VAD config
@@ -91,7 +93,7 @@ async def vad_config_page(request: Request):
     page = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VAD 参数配置 - ASV 声纹识别系统</title>
+<title>VAD 参数配置 - 声纹管理系统</title>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0 }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -118,11 +120,10 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">模型管理</a>
-    <a href="/model-manager/segments">录音断句</a>
-    <a href="/model-manager/vad-config" style="color:#fff;font-weight:bold">VAD 参数</a>
-    <span class="user">{user.get('username','')} (模型管理员)</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">VAD参数</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>
@@ -318,7 +319,7 @@ def _render_segment_page(user, recordings, pending_count, agents, vad_cfg,
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>录音断句 - ASV 声纹识别系统</title>
+<title>录音断句 - 声纹管理系统</title>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0 }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -359,11 +360,10 @@ tr:hover {{ background:#f8f9fa }}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">模型管理</a>
-    <a href="/model-manager/segments" class="nav-active">录音断句</a>
-    <a href="/model-manager/vad-config">VAD 参数</a>
-    <span class="user">{user.get('username','')} (模型管理员)</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">录音断句</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>
@@ -554,7 +554,7 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>录音详情 - {recording.get('call_id','')} - ASV</title>
+<title>录音详情 - {recording.get('call_id','')} - 声纹管理系统</title>
 <style>
 * {{ box-sizing:border-box; margin:0; padding:0 }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -584,10 +584,9 @@ audio {{ width:100%; margin-top:8px }}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">模型管理</a>
-    <a href="/model-manager/segments" style="color:#fff;font-weight:bold">录音断句</a>
-    <a href="/model-manager/vad-config">VAD 参数</a>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">录音详情</span>
     <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
@@ -844,7 +843,7 @@ async def label_speakers_page(
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>说话人打标 - ASV 声纹识别系统</title>
+<title>说话人打标 - 声纹管理系统</title>
 <style>
 * {{ margin:0;padding:0;box-sizing:border-box }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -871,13 +870,10 @@ audio{{width:100%}}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">首页</a>
-    <a href="/model-manager/segments">录音断句</a>
-    <a href="/model-manager/label" class="active">说话人打标</a>
-    <a href="/model-manager/vad-config">VAD 参数</a>
-    <a href="/model-manager/training">增量训练</a>
-    <span class="user">{user.get("username","")}</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">说话人打标</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>
@@ -1010,7 +1006,7 @@ def _render_training_page(user, versions, pending):
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>增量训练 - ASV</title>
+<title>增量训练 - 声纹管理系统</title>
 <style>
 * {{ margin:0;padding:0;box-sizing:border-box }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -1046,12 +1042,10 @@ td{{padding:6px 8px;font-size:13px;border-bottom:1px solid #eee}}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">首页</a>
-    <a href="/model-manager/segments">录音断句</a>
-    <a href="/model-manager/label">说话人打标</a>
-    <a href="/model-manager/training" class="active">增量训练</a>
-    <span class="user">{user.get("username","")}</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">增量训练</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>
@@ -1200,16 +1194,55 @@ async def model_detail_page(request: Request):
     from collections import defaultdict
     grouped = defaultdict(list)
     for v in versions:
-        grouped[v.get("model_name","unknown")].append(v)
+        grouped[v.get("model_name", "unknown")].append(v)
+
+    # 同时扫描文件系统的快照
+    import json as json_mod
+    model_data_root = PROJECT_ROOT / "model_data" / "checkpoints"
+    fs_snapshot_counts = {}
+    fs_versions = defaultdict(list)
+    if model_data_root.exists():
+        for mdir in model_data_root.iterdir():
+            mname = mdir.name
+            if not mdir.is_dir():
+                continue
+            count = 0
+            for vdir in sorted(mdir.iterdir()):
+                if not vdir.is_dir():
+                    continue
+                manifest = vdir / "manifest.json"
+                vtag = vdir.name
+                # 检查是否已 DB 中有（去重）
+                db_keys = {v.get("version_tag", "") for v in grouped.get(mname, [])}
+                db_key = f"{mname}@{vtag}" if "@" in vtag else vtag
+                if any(db_key in k for k in db_keys):
+                    continue
+                count += 1
+                vinfo = {"model_name": mname, "version_tag": f"[fs] {vtag}",
+                         "status": "published", "score": None,
+                         "created_at": ""}
+                if manifest.exists():
+                    try:
+                        meta = json_mod.loads(manifest.read_text())
+                        vinfo["created_at"] = meta.get("created_at", "")[:16]
+                    except Exception:
+                        pass
+                fs_versions[mname].append(vinfo)
+                # 也追加到 grouped 中以展示版本表格
+                grouped[mname].append(vinfo)
+            fs_snapshot_counts[mname] = count
     published = {}
     for name in grouped:
         pv = [v for v in grouped[name] if v.get("status") == "published"]
         published[name] = pv[0] if pv else None
-    return HTMLResponse(render_model_detail_page(user, grouped, published, versions))
+    return HTMLResponse(render_model_detail_page(user, grouped, published, versions,
+                                                  fs_snapshot_counts=fs_snapshot_counts))
 
 
-def render_model_detail_page(user, grouped, published, all_versions):
+def render_model_detail_page(user, grouped, published, all_versions,
+                             fs_snapshot_counts=None):
     user = user or {}
+    fs_snapshot_counts = fs_snapshot_counts or {}
     model_infos = {
         "CAM++": {
             "dim": 192, "desc": "CAM++ (Concat-Aggregated MFCC Plus Plus)，电话场景分离最佳",
@@ -1237,15 +1270,23 @@ def render_model_detail_page(user, grouped, published, all_versions):
         pub_tag = pub.get("version_tag","—") if pub else "未发布"
         latest = vlist[-1] if vlist else None
         vt = ""
+        fs_cnt = fs_snapshot_counts.get(mname, 0)
+        db_cnt = len(vlist) - fs_cnt
         for v in vlist[::-1][:10]:
-            sc = f"{v.get('score',''):.4f}" if v.get("score") else "—"
-            vt += "<tr>"
-            vt += f'<td>{v.get("version_tag","")}</td>'
-            vt += f'<td><span class="badge badge-{v.get("status","gray")}">{v.get("status","")}</span></td>'
+            sc = f"{v.get('score',''):.4f}" if v.get('score') else "—"
+            vtag = v.get('version_tag', '')
+            is_fs = vtag.startswith('[fs]')
+            tag = vtag[5:] if is_fs else vtag
+            tstatus = '快照' if is_fs else v.get('status', '')
+            tcolor = 'green' if is_fs else v.get('status', 'gray')
+            fscls = ' class="fs-row"' if is_fs else ''
+            vt += f'<tr{fscls}>'
+            vt += f'<td>{tag}</td>'
+            vt += f'<td><span class="badge badge-{tcolor}">{tstatus}</span></td>'
             vt += f'<td>{sc}</td>'
-            vt += f'<td>{v.get("created_at","")[:16]}</td>'
-            vt += "</tr>"
-        latest_sc = f"{latest['score']:.4f}" if latest and latest.get("score") else "—"
+            vt += f"<td>{v.get('created_at', '')[:16]}</td>"
+            vt += '</tr>'
+        latest_sc = f"{latest['score']:.4f}" if latest and latest.get('score') else "—"
         dim_val = info["dim"]
         cards += f"""<div class="card">
             <h2>{mname} <span class="badge badge-blue">{dim_val}d</span></h2>
@@ -1255,17 +1296,17 @@ def render_model_detail_page(user, grouped, published, all_versions):
                 <div class="info-item"><div class="info-label">参数量</div><div class="info-value">{info["params"]}</div></div>
                 <div class="info-item"><div class="info-label">网络结构</div><div class="info-value" style="font-size:11px">{info["layers"]}</div></div>
                 <div class="info-item"><div class="info-label">已发布版本</div><div class="info-value">{pub_tag}</div></div>
-                <div class="info-item"><div class="info-label">训练版本数</div><div class="info-value">{len(vlist)}</div></div>
+                <div class="info-item"><div class="info-label">快照总数</div><div class="info-value">{db_cnt + fs_cnt} <span style="font-size:11px;color:#999">(文件系统:{fs_cnt} DB:{db_cnt})</span></div></div>
                 <div class="info-item"><div class="info-label">最新评分</div><div class="info-value">{latest_sc}</div></div>
-                <div class="info-item" style="grid-column:1/-1"><div class="info-label">模型路径</div><div class="info-value" style="font-size:11px;font-family:monospace">{info["path"]}</div></div>
+                <div class="info-item" style="grid-column:1/-1"><div class="info-label">快照目录</div><div class="info-value" style="font-size:11px;font-family:monospace">app/model_data/checkpoints/{mname}/</div></div>
             </div>
-            {f'''<table style="margin-top:12px"><thead><tr><th>版本</th><th>状态</th><th>评分</th><th>时间</th></tr></thead><tbody>{vt}</tbody></table>''' if vt else '<p style="color:#999;font-size:13px">暂无训练版本</p>'}
+            {f'''<table style="margin-top:12px"><thead><tr><th>版本</th><th>状态</th><th>评分</th><th>时间</th></tr></thead><tbody>{vt}</tbody></table>''' if vt else '<p style="color:#999;font-size:13px">暂无版本或快照</p>'}
         </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>模型详情 - ASV</title>
+<title>模型详情 - 声纹管理系统</title>
 <style>
 * {{ margin:0;padding:0;box-sizing:border-box }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -1289,16 +1330,15 @@ td{{padding:6px;border-bottom:1px solid #eee}}
 .badge-orange{{background:#fef3cd;color:#856404}}
 .badge-gray{{background:#f1f5f9;color:#64748b}}
 .badge-red{{background:#f8d7da;color:#721c24}}
+.fs-row{{background:#f0fdf4;font-size:12px;color:#666}}
+.fs-row td:first-child::before{{content:"📁 ";font-size:10px}}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">首页</a>
-    <a href="/model-manager/segments">录音断句</a>
-    <a href="/model-manager/training">增量训练</a>
-    <a href="/model-manager/models" class="active">模型详情</a>
-    <a href="/model-manager/publish">发布管理</a>
-    <span class="user">{user.get("username","")}</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">模型管理</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>
@@ -1361,13 +1401,13 @@ def render_publish_page(user, checkpoints, versions):
             rows = "<tr><td colspan='6' style='text-align:center;color:#999'>暂无 checkpoint</td></tr>"
         vt = ""
         for v in vfm[::-1][:5]:
-            sc = f"{v.get('score',''):.4f}" if v.get("score") else "—"
+            sc = f"{v.get('score',''):.4f}" if v.get('score') else "—"
             vt += "<tr>"
             vt += f'<td>{v.get("version_tag","")}</td>'
             vt += f'<td>{v.get("status","")}</td>'
             vt += f'<td>{sc}</td>'
             vt += f'<td>{v.get("created_at","")[:16]}</td>'
-            vt += "</tr>"
+            vt += '</tr>'
         sections += f"""<div class="card">
             <h2>{mname}</h2>
             <div style="display:flex;gap:24px;margin-bottom:16px">
@@ -1383,7 +1423,7 @@ def render_publish_page(user, checkpoints, versions):
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>模型发布 - ASV</title>
+<title>模型发布 - 声纹管理系统</title>
 <style>
 * {{ margin:0;padding:0;box-sizing:border-box }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f6fa; color:#2c3e50 }}
@@ -1409,12 +1449,10 @@ tr.pub-row{{background:#d4edda}}
 </style></head>
 <body>
 <div class="nav">
-    <strong>ASV 声纹识别系统</strong>
-    <a href="/model-manager">首页</a>
-    <a href="/model-manager/segments">录音断句</a>
-    <a href="/model-manager/models">模型详情</a>
-    <a href="/model-manager/publish" class="active">发布管理</a>
-    <span class="user">{user.get("username","")}</span>
+    <strong>声纹管理系统</strong>
+    <a href="/model-manager">← 首页</a>
+    <span style="color:#fff;font-weight:bold">模型发布</span>
+    <span class="user">{user.get('username','')}</span>
     <a href="/change-password">修改密码</a>
     <a href="/logout">退出</a>
 </div>

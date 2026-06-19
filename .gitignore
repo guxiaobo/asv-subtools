@@ -16,3 +16,4 @@ __pycache__
 /app/data
 /app/pytorch_weights
 /app/test
+/app/model_data

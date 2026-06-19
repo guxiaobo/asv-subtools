@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from schemas import (
@@ -26,6 +27,7 @@ from schemas import (
     VerifyIndirectRequest,
     VerifyResponse,
 )
+from services.recording_db import log_api_call
 from services.verifier import SpeakerVerifier
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,7 @@ async def _resolve_single_audio(
 # ---------------------------------------------------------------------------
 @router.post("/verify", response_model=VerifyResponse)
 async def verify(
+    request: Request,
     # Direct mode: files
     audio_a: Optional[UploadFile] = File(default=None, description="Speaker A audio file"),
     audio_b: Optional[UploadFile] = File(default=None, description="Speaker B audio file"),
@@ -144,6 +147,7 @@ async def verify(
     Returns similarity score + binary decision.
     """
     verifier = _get_verifier()
+    t0 = time.time()
 
     # Resolve each audio independently (file > url > id)
     bytes_a, label_a = await _resolve_single_audio(
@@ -165,11 +169,43 @@ async def verify(
         audio_id_b=label_b,
     )
 
+    duration_ms = int((time.time() - t0) * 1000) if "t0" in dir() else 0
+
     if not result.success:
+        # Log the failure
+        _determine_source = lambda f, u, i: ("file", f.filename if f else "") if f else (("url", u or "") if u else ("audio_id", i or ""))
+        a_src, a_val = _determine_source(audio_a, url_a, audio_id_a)
+        b_src, b_val = _determine_source(audio_b, url_b, audio_id_b)
+        await log_api_call(
+            endpoint="/api/verify",
+            audio_a_source=a_src, audio_a_value=a_val,
+            audio_b_source=b_src, audio_b_value=b_val,
+            has_audio_data=audio_a is not None or audio_b is not None,
+            duration_ms=duration_ms,
+            scenario=scenario,
+            caller_ip=request.client.host if request.client else None,
+            error_detail=result.error,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=result.error,
         )
+
+    # Log the successful call
+    a_src, a_val = (("file", audio_a.filename if audio_a else "") if audio_a else (("url", url_a or "") if url_a else ("audio_id", audio_id_a or "")))
+    b_src, b_val = (("file", audio_b.filename if audio_b else "") if audio_b else (("url", url_b or "") if url_b else ("audio_id", audio_id_b or "")))
+    await log_api_call(
+        endpoint="/api/verify",
+        audio_a_source=a_src, audio_a_value=a_val,
+        audio_b_source=b_src, audio_b_value=b_val,
+        has_audio_data=audio_a is not None or audio_b is not None,
+        duration_ms=duration_ms,
+        score=result.score,
+        decision="same" if result.match else "different",
+        threshold=result.threshold,
+        scenario=scenario,
+        caller_ip=request.client.host if request.client else None,
+    )
 
     return result
 
@@ -211,7 +247,8 @@ def _resolve_single_audio_indirect(
 # ---------------------------------------------------------------------------
 @router.post("/verify/indirect", response_model=VerifyResponse)
 async def verify_indirect(
-    request: VerifyIndirectRequest,
+    request: Request,
+    request_body: VerifyIndirectRequest,
 ) -> VerifyResponse:
     """
     Verify two speakers by audio ID or URL (JSON body version).
@@ -246,29 +283,59 @@ async def verify_indirect(
         }
     """
     verifier = _get_verifier()
+    t0 = time.time()
 
     # Per-audio resolution for JSON body as well
     bytes_a, label_a = _resolve_single_audio_indirect(
-        verifier, request.audio_a, "A",
+        verifier, request_body.audio_a, "A",
     )
     bytes_b, label_b = _resolve_single_audio_indirect(
-        verifier, request.audio_b, "B",
+        verifier, request_body.audio_b, "B",
     )
 
     result = verifier.verify_from_bytes(
         audio_bytes_a=bytes_a,
         audio_bytes_b=bytes_b,
-        threshold=request.threshold,
-        scoring_method=request.scoring_method.value if request.scoring_method else None,
-        scenario=request.scenario.value if request.scenario else None,
+        threshold=request_body.threshold,
+        scoring_method=request_body.scoring_method.value if request_body.scoring_method else None,
+        scenario=request_body.scenario.value if request_body.scenario else None,
         audio_id_a=label_a,
         audio_id_b=label_b,
     )
 
+    duration_ms = int((time.time() - t0) * 1000)
+
+    def _ref_source(ref):
+        return ("url", ref.url) if ref.url else ("audio_id", ref.audio_id or "")
+
+    a_src, a_val = _ref_source(request_body.audio_a)
+    b_src, b_val = _ref_source(request_body.audio_b)
+
     if not result.success:
+        await log_api_call(
+            endpoint="/api/verify/indirect",
+            audio_a_source=a_src, audio_a_value=a_val,
+            audio_b_source=b_src, audio_b_value=b_val,
+            duration_ms=duration_ms,
+            scenario=request_body.scenario.value if request_body.scenario else None,
+            caller_ip=request.client.host if request.client else None,
+            error_detail=result.error,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=result.error,
         )
+
+    await log_api_call(
+        endpoint="/api/verify/indirect",
+        audio_a_source=a_src, audio_a_value=a_val,
+        audio_b_source=b_src, audio_b_value=b_val,
+        duration_ms=duration_ms,
+        score=result.score,
+        decision="same" if result.match else "different",
+        threshold=result.threshold,
+        scenario=request_body.scenario.value if request_body.scenario else None,
+        caller_ip=request.client.host if request.client else None,
+    )
 
     return result
