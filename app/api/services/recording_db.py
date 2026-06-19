@@ -928,36 +928,26 @@ async def get_dashboard_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         stats["unlabeled_segments"] = (await cur.fetchone())["cnt"]
 
         # ── 模型信息 ──
+        # 系统只有三个 PyTorch 模型定义（CAM++ / ECAPA / ResNet34）。
+        # 每个 model_name 各有一个预训练 checkpoint + 若干增量训练 checkpoint。
+        # version_count 直接从 checkpoints 表按 model_name 分组取得。
+        CANONICAL_MODELS = ("CAM++", "ECAPA", "ResNet34")
+
         cur = await conn.execute(
             "SELECT model_name, COUNT(*) AS version_count "
-            "FROM checkpoints GROUP BY model_name ORDER BY model_name"
+            "FROM checkpoints GROUP BY model_name"
         )
         db_models = {r["model_name"]: r["version_count"] for r in await cur.fetchall()}
 
-        # Also scan filesystem for physically present model files
-        models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
-        fs_models: dict = {}
-        if os.path.isdir(models_dir):
-            for fname in os.listdir(models_dir):
-                if fname.endswith((".onnx", ".pt", ".pth", ".bin", ".gguf")):
-                    # Strip extension, extract meaningful name
-                    name = os.path.splitext(fname)[0]
-                    if name not in fs_models:
-                        fs_models[name] = 0
-                    fs_models[name] += 1
-
-        # Merge: filesystem models always shown; DB adds version_count info
-        all_model_names = sorted(set(list(db_models.keys()) + list(fs_models.keys())))
-        merged = []
-        for name in all_model_names:
-            merged.append({
-                "model_name": name,
-                "version_count": db_models.get(name, 0),
-            })
+        merged = [
+            {"model_name": name, "version_count": db_models.get(name, 0)}
+            for name in CANONICAL_MODELS
+        ]
         stats["models"] = merged
-        stats["total_models"] = len(merged)
+        stats["total_models"] = len(CANONICAL_MODELS)
 
-        # Also list the raw fs files for diagnostics
+        # 文件系统 ONNX/PT 文件仅作诊断用，不计入模型定义列表
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
         stats["fs_model_files"] = sorted(
             [f for f in (os.listdir(models_dir) if os.path.isdir(models_dir) else [])
              if f.endswith((".onnx", ".pt", ".pth", ".bin", ".gguf"))]

@@ -24,9 +24,14 @@ ROLE_MODEL_MANAGER = "model_manager"
 router = APIRouter()
 logger = logging.getLogger("model_manager_router")
 
-# Project root (two levels up from this router file)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # asv-subtools/
-APP_DIR = PROJECT_ROOT / "app"
+# Path resolution
+# __file__ = app/api/routers/model_manager_router.py
+#   .parent            = app/api/routers
+#   .parent.parent     = app/api
+#   .parent.parent.parent = app/
+_APP_DIR = Path(__file__).resolve().parent.parent.parent  # app/
+APP_DIR = _APP_DIR
+PROJECT_ROOT = _APP_DIR.parent                              # asv-subtools/
 TEMPLATES_DIR = APP_DIR / "api" / "templates"
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "training.db"
@@ -1185,122 +1190,136 @@ async def compare_versions(request: Request, a_id: int, b_id: int):
 async def model_detail_page(request: Request):
     await require_role(ROLE_MODEL_MANAGER)(request)
     user = request.state.current_user
-    db = _recordings_db()
-    versions = []
-    try:
-        versions = await db.list_model_versions(limit=100)
-    except Exception:
-        pass
+
+    # ── 直接从 SQLite 读取 model_definitions + checkpoints（含 DAG lineage）──
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(DB_PATH))
+    conn.row_factory = _sqlite3.Row
+
+    # 1) 模型架构定义
+    def_rows = conn.execute(
+        "SELECT id, name, arch_version, code_path, code_hash, class_name, "
+        "embedding_dim, description, created_at, created_by "
+        "FROM model_definitions ORDER BY name"
+    ).fetchall()
+    model_defs = [dict(r) for r in def_rows]
+
+    # 2) checkpoints（按 model_name 分组，带 base/audit 字段）
+    ck_rows = conn.execute(
+        "SELECT c.id, c.model_name, c.version_tag, c.file_path, c.file_size, "
+        "c.embedding_dim, c.metrics, c.is_published, c.model_def_id, "
+        "c.base_checkpoint_id, c.status, c.trained_at, c.created_at, c.created_by "
+        "FROM checkpoints c ORDER BY c.model_name, c.id"
+    ).fetchall()
+    all_ckpts = [dict(r) for r in ck_rows]
+
+    # 3) 每个 checkpoint 的训练数据片段数
+    seg_counts = {}
+    for r in conn.execute(
+        "SELECT checkpoint_id, COUNT(*) AS cnt FROM checkpoint_training_segments GROUP BY checkpoint_id"
+    ):
+        seg_counts[r["checkpoint_id"]] = r["cnt"]
+
+    conn.close()
+
+    return HTMLResponse(render_model_detail_page(
+        user, model_defs, all_ckpts, seg_counts,
+        fs_root=APP_DIR / "model_data" / "checkpoints",
+    ))
+
+
+def render_model_detail_page(user, model_defs, all_ckpts, seg_counts, fs_root=None):
+    """渲染模型详情页。
+
+    Args:
+        user: 当前用户 dict
+        model_defs: model_definitions 行列表
+        all_ckpts: checkpoints 行列表（含 model_def_id / base_checkpoint_id / status）
+        seg_counts: {checkpoint_id: 训练片段数}
+        fs_root: 文件系统快照根目录（用于检测 DB 外的快照）
+    """
     from collections import defaultdict
-    grouped = defaultdict(list)
-    for v in versions:
-        grouped[v.get("model_name", "unknown")].append(v)
-
-    # 同时扫描文件系统的快照
-    import json as json_mod
-    model_data_root = PROJECT_ROOT / "model_data" / "checkpoints"
-    fs_snapshot_counts = {}
-    fs_versions = defaultdict(list)
-    if model_data_root.exists():
-        for mdir in model_data_root.iterdir():
-            mname = mdir.name
-            if not mdir.is_dir():
-                continue
-            count = 0
-            for vdir in sorted(mdir.iterdir()):
-                if not vdir.is_dir():
-                    continue
-                manifest = vdir / "manifest.json"
-                vtag = vdir.name
-                # 检查是否已 DB 中有（去重）
-                db_keys = {v.get("version_tag", "") for v in grouped.get(mname, [])}
-                db_key = f"{mname}@{vtag}" if "@" in vtag else vtag
-                if any(db_key in k for k in db_keys):
-                    continue
-                count += 1
-                vinfo = {"model_name": mname, "version_tag": f"[fs] {vtag}",
-                         "status": "published", "score": None,
-                         "created_at": ""}
-                if manifest.exists():
-                    try:
-                        meta = json_mod.loads(manifest.read_text())
-                        vinfo["created_at"] = meta.get("created_at", "")[:16]
-                    except Exception:
-                        pass
-                fs_versions[mname].append(vinfo)
-                # 也追加到 grouped 中以展示版本表格
-                grouped[mname].append(vinfo)
-            fs_snapshot_counts[mname] = count
-    published = {}
-    for name in grouped:
-        pv = [v for v in grouped[name] if v.get("status") == "published"]
-        published[name] = pv[0] if pv else None
-    return HTMLResponse(render_model_detail_page(user, grouped, published, versions,
-                                                  fs_snapshot_counts=fs_snapshot_counts))
-
-
-def render_model_detail_page(user, grouped, published, all_versions,
-                             fs_snapshot_counts=None):
     user = user or {}
-    fs_snapshot_counts = fs_snapshot_counts or {}
-    model_infos = {
-        "CAM++": {
-            "dim": 192, "desc": "CAM++ (Concat-Aggregated MFCC Plus Plus)，电话场景分离最佳",
-            "path": "api/models/CAM++_cnceleb",
-            "layers": "CAM++ 前端(conv1d/BN/ReLU) → DenseRes2Net → ASP → FC256/192",
-            "params": "~7.2M"
-        },
-        "ResNet34": {
-            "dim": 256, "desc": "ResNet34 残差网络，256维embedding，通用性强",
-            "path": "api/models/ResNet34_cnceleb",
-            "layers": "Conv1x3x3 → 4×[3x3 ResBlock]×{3,4,6,3} → GAP → FC512/256",
-            "params": "~21.8M"
-        },
-        "ECAPA": {
-            "dim": 192, "desc": "ECAPA-TDNN，时延神经网络+通道注意力",
-            "path": "api/models/ECAPA_cnceleb",
-            "layers": "TDNN front-end → SE-Res2Block ×3 → ASP+ChannelAttn → FC192",
-            "params": "~6.5M"
-        }
+    fs_root = fs_root or Path()
+
+    # 按模型名分组 checkpoint
+    ck_by_name = defaultdict(list)
+    for c in all_ckpts:
+        ck_by_name[c.get("model_name", "")].append(c)
+    # 建立 checkpoint_id → version_tag 映射（用于显示 base lineage）
+    id_to_tag = {c["id"]: c.get("version_tag", "?") for c in all_ckpts}
+
+    # 模型架构信息（网络结构描述，补充展示用）
+    ARCH_INFO = {
+        "CAM++": {"layers": "前端(conv1d/BN/ReLU) → DenseRes2Net → ASP → FC256/192", "params": "~7.2M"},
+        "ECAPA": {"layers": "TDNN front-end → SE-Res2Block ×3 → ASP+ChannelAttn → FC192", "params": "~6.5M"},
+        "ResNet34": {"layers": "Conv1x3x3 → 4×[3x3 ResBlock]×{3,4,6,3} → GAP → FC512/256", "params": "~21.8M"},
     }
+
     cards = ""
-    for mname, info in model_infos.items():
-        vlist = grouped.get(mname, [])
-        pub = published.get(mname)
-        pub_tag = pub.get("version_tag","—") if pub else "未发布"
-        latest = vlist[-1] if vlist else None
-        vt = ""
-        fs_cnt = fs_snapshot_counts.get(mname, 0)
-        db_cnt = len(vlist) - fs_cnt
-        for v in vlist[::-1][:10]:
-            sc = f"{v.get('score',''):.4f}" if v.get('score') else "—"
-            vtag = v.get('version_tag', '')
-            is_fs = vtag.startswith('[fs]')
-            tag = vtag[5:] if is_fs else vtag
-            tstatus = '快照' if is_fs else v.get('status', '')
-            tcolor = 'green' if is_fs else v.get('status', 'gray')
-            fscls = ' class="fs-row"' if is_fs else ''
-            vt += f'<tr{fscls}>'
-            vt += f'<td>{tag}</td>'
-            vt += f'<td><span class="badge badge-{tcolor}">{tstatus}</span></td>'
-            vt += f'<td>{sc}</td>'
-            vt += f"<td>{v.get('created_at', '')[:16]}</td>"
-            vt += '</tr>'
-        latest_sc = f"{latest['score']:.4f}" if latest and latest.get('score') else "—"
-        dim_val = info["dim"]
+    for mdef in model_defs:
+        mname = mdef["name"]
+        dim_val = mdef.get("embedding_dim", 0)
+        arch = ARCH_INFO.get(mname, {"layers": "—", "params": "—"})
+        cks = sorted(ck_by_name.get(mname, []), key=lambda x: x.get("id", 0))
+
+        # 预训练 / 增量分离
+        pretrained = [c for c in cks if c.get("status") == "pretrained"]
+        incremental = [c for c in cks if c.get("status") == "incremental"]
+
+        # checkpoint 表格（含 DAG lineage + 训练数据来源）
+        ck_rows_html = ""
+        for c in cks:
+            vtag = c.get("version_tag", "").replace(f"{mname}@", "")
+            st = c.get("status", "")
+            st_badge = {"pretrained": "blue", "incremental": "green",
+                        "published": "orange", "archived": "gray"}.get(st, "gray")
+            st_label = {"pretrained": "预训练", "incremental": "增量",
+                        "published": "已发布", "archived": "归档"}.get(st, st)
+            base_id = c.get("base_checkpoint_id")
+            base_label = f"← {id_to_tag.get(base_id, '?')}" if base_id else "—"
+            seg_n = seg_counts.get(c["id"], 0)
+            seg_label = f"{seg_n} 段" if seg_n else "—"
+            ts = (c.get("trained_at") or c.get("created_at") or "")[:16]
+            ck_rows_html += (
+                f'<tr>'
+                f'<td>{vtag}</td>'
+                f'<td><span class="badge badge-{st_badge}">{st_label}</span></td>'
+                f'<td style="font-size:11px;color:#64748b">{base_label}</td>'
+                f'<td>{seg_label}</td>'
+                f'<td style="font-size:11px">{ts}</td>'
+                f'</tr>'
+            )
+        ck_table = (
+            f'<table style="margin-top:12px"><thead><tr>'
+            f'<th>版本</th><th>状态</th><th>基础来源</th><th>训练数据</th><th>时间</th>'
+            f'</tr></thead><tbody>{ck_rows_html}</tbody></table>'
+            if ck_rows_html else '<p style="color:#999;font-size:13px">暂无 checkpoint</p>'
+        )
+
+        # 文件系统快照检测
+        fs_dir = fs_root / mname
+        fs_dirs = [d.name for d in fs_dir.iterdir() if d.is_dir()] if fs_dir.exists() else []
+
         cards += f"""<div class="card">
-            <h2>{mname} <span class="badge badge-blue">{dim_val}d</span></h2>
-            <p style="font-size:13px;color:#666;margin-bottom:12px">{info["desc"]}</p>
+            <h2>{mname}
+                <span class="badge badge-blue">{dim_val}d</span>
+                <span class="badge badge-gray">架构 {mdef.get('arch_version','v1')}</span>
+            </h2>
+            <p style="font-size:13px;color:#666;margin-bottom:12px">{mdef.get('description','')}</p>
             <div class="info-grid">
                 <div class="info-item"><div class="info-label">Embedding维度</div><div class="info-value">{dim_val}</div></div>
-                <div class="info-item"><div class="info-label">参数量</div><div class="info-value">{info["params"]}</div></div>
-                <div class="info-item"><div class="info-label">网络结构</div><div class="info-value" style="font-size:11px">{info["layers"]}</div></div>
-                <div class="info-item"><div class="info-label">已发布版本</div><div class="info-value">{pub_tag}</div></div>
-                <div class="info-item"><div class="info-label">快照总数</div><div class="info-value">{db_cnt + fs_cnt} <span style="font-size:11px;color:#999">(文件系统:{fs_cnt} DB:{db_cnt})</span></div></div>
-                <div class="info-item"><div class="info-label">最新评分</div><div class="info-value">{latest_sc}</div></div>
+                <div class="info-item"><div class="info-label">参数量</div><div class="info-value">{arch["params"]}</div></div>
+                <div class="info-item"><div class="info-label">预训练快照</div><div class="info-value">{len(pretrained)}</div></div>
+                <div class="info-item"><div class="info-label">增量快照</div><div class="info-value">{len(incremental)}</div></div>
+                <div class="info-item"><div class="info-label">PyTorch类</div><div class="info-value" style="font-size:12px">{mdef.get('class_name','')}</div></div>
+                <div class="info-item"><div class="info-label">代码Hash</div><div class="info-value" style="font-size:11px;font-family:monospace">{mdef.get('code_hash','') or '—'}</div></div>
+                <div class="info-item" style="grid-column:1/-1"><div class="info-label">代码位置</div><div class="info-value" style="font-size:11px;font-family:monospace">{mdef.get('code_path','')}</div></div>
+                <div class="info-item" style="grid-column:1/-1"><div class="info-label">网络结构</div><div class="info-value" style="font-size:11px">{arch["layers"]}</div></div>
                 <div class="info-item" style="grid-column:1/-1"><div class="info-label">快照目录</div><div class="info-value" style="font-size:11px;font-family:monospace">app/model_data/checkpoints/{mname}/</div></div>
             </div>
-            {f'''<table style="margin-top:12px"><thead><tr><th>版本</th><th>状态</th><th>评分</th><th>时间</th></tr></thead><tbody>{vt}</tbody></table>''' if vt else '<p style="color:#999;font-size:13px">暂无版本或快照</p>'}
+            {ck_table}
+            {f'<p style="font-size:11px;color:#999;margin-top:8px">文件系统快照: {", ".join(fs_dirs)}</p>' if fs_dirs else ''}
         </div>"""
 
     return f"""<!DOCTYPE html>
@@ -1330,8 +1349,7 @@ td{{padding:6px;border-bottom:1px solid #eee}}
 .badge-orange{{background:#fef3cd;color:#856404}}
 .badge-gray{{background:#f1f5f9;color:#64748b}}
 .badge-red{{background:#f8d7da;color:#721c24}}
-.fs-row{{background:#f0fdf4;font-size:12px;color:#666}}
-.fs-row td:first-child::before{{content:"📁 ";font-size:10px}}
+.legend{{font-size:11px;color:#999;margin-bottom:12px;padding:8px;background:#fffbe6;border-radius:6px;border:1px solid #ffe58f}}
 </style></head>
 <body>
 <div class="nav">
@@ -1343,6 +1361,10 @@ td{{padding:6px;border-bottom:1px solid #eee}}
     <a href="/logout">退出</a>
 </div>
 <div class="container">
+    <div class="legend">
+        ℹ️ 共 {len(model_defs)} 个模型定义。"基础来源"列显示该增量 checkpoint 由哪个 checkpoint 继续训练（DAG 演化链）。
+        "训练数据"列显示该 checkpoint 用了多少语音片段做增量训练。架构变化（结构性）会创建新的 arch_version 分支。
+    </div>
     {cards}
 </div>
 </body>
