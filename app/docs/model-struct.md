@@ -1,9 +1,11 @@
 # 模型架构与训练算法
 
-> 更新时间：2026-06-19
-> 文件位置：`app/train/fine_tune.py`（PyTorch 定义 + 训练流程）
+> 更新时间：2026-06-22
+> 代码位置：`app/train/fine_tune.py`（PyTorch 定义 + 训练循环）
 > 推理引擎：`app/api/services/verifier.py`（ONNX Runtime）
 > 评估脚本：`app/train/evaluate.py`
+> 模型注册：`model_definitions` / `checkpoints` 表（SQLite）
+> 打标轨迹：`segment_label_history` / `audio_segments.trained_status`
 
 ---
 
@@ -16,6 +18,10 @@
 5. [训练算法](#5-训练算法)
 6. [推理流程](#6-推理流程)
 7. [评估方法](#7-评估方法)
+8. [模型生命周期管理（SQLite 注册体系）](#8-模型生命周期管理sqlite-注册体系)
+9. [打标生命周期与训练就绪状态](#9-打标生命周期与训练就绪状态)
+10. [ONNX 部署映射](#10-onnx-部署映射)
+11. [WEB API 架构总览](#11-web-api-架构总览)
 
 ---
 
@@ -473,6 +479,358 @@ for each speaker:
 
 | 模型 | 参数 | 预训练数据集 | 原始实现 |
 |------|------|-------------|---------|
-| CAM++ | ~6.2M (backbone) | CN-Celeb | WeSpeaker / egrecho |
-| ECAPA-TDNN | ~6.4M | VoxCeleb1+2 | WeSpeaker / SpeechBrain |
-| ResNet34 | ~8.3M | VoxCeleb1+2 | ASV-Subtools v1 |
+|| CAM++ | ~6.2M (backbone) | CN-Celeb | WeSpeaker / egrecho |
+|| ECAPA-TDNN | ~6.4M | VoxCeleb1+2 | WeSpeaker / SpeechBrain |
+|| ResNet34 | ~8.3M | VoxCeleb1+2 | ASV-Subtools v1 |
+
+---
+
+## 8. 模型生命周期管理（SQLite 注册体系）
+
+**数据库表：** `model_definitions`、`checkpoints`、`checkpoint_training_segments`
+
+### 8.1 模型架构定义 (`model_definitions`)
+
+```
+TABLE model_definitions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL,              -- 模型名（如 "CAM++"）
+    arch_version    TEXT    NOT NULL DEFAULT 'v1', -- 架构版本（结构性变更时递增）
+    code_path       TEXT,                          -- 源码路径（如 pytorch/model/cam++.py）
+    python_class    TEXT,                          -- Python 类名（如 "CAMPlus"）
+    code_hash       TEXT,                          -- 源码指纹（非结构性变更时更新）
+    embedding_dim   INTEGER NOT NULL DEFAULT 192,  -- embedding 维度
+    feat_dim        INTEGER NOT NULL DEFAULT 80,   -- 输入特征维度
+    num_speakers    INTEGER,                       -- 训练时说话人数量
+    description     TEXT,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(name, arch_version)
+)
+```
+
+**分支策略：**
+- **结构性变更**（层数/维度改变导致 checkpoint 不兼容）→ 新建 `arch_version` 分支（如 `v1` → `v2`）
+- **非结构性变更**（bugfix/超参调整）→ 同一 `arch_version` 内仅更新 `code_hash`
+- 注册操作通过 `app/api/services/recording_db.py` 中的 `register_model_definition()` 完成
+
+### 8.2 模型检查点 (`checkpoints`)
+
+```
+TABLE checkpoints (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_def_id        INTEGER REFERENCES model_definitions(id),
+    model_name          TEXT    NOT NULL,
+    version_tag         TEXT    NOT NULL,           -- 语义版本号（如 "v1.0", "v1.1"）
+    base_checkpoint_id  INTEGER,                   -- 自引用：若为增量训练，指向 base checkpoint
+    status              TEXT    NOT NULL DEFAULT 'created',
+                                                    -- created | training | done | failed | published
+    file_path           TEXT,                       -- ONNX/PyTorch 文件路径
+    file_size           INTEGER,
+    embedding_dim       INTEGER,
+    metrics             TEXT,                       -- JSON：训练评估指标
+    is_published        INTEGER NOT NULL DEFAULT 0, -- 是否发布为 API 服务使用
+    trained_segments    INTEGER DEFAULT 0,          -- 训练使用的片段数
+    trained_speakers    INTEGER DEFAULT 0,          -- 训练使用的说话人数
+    description         TEXT,
+    created_by          TEXT,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    UNIQUE(model_name, version_tag)
+)
+```
+
+**DAG 版本链（Lineage）：**
+
+每条 `checkpoint` 记录通过 `base_checkpoint_id` 自引用形成有向无环图：
+
+```
+pretrained (v1.0)
+    ├── incremental_v1 (v1.1)  → 使用新打标片段增量训练
+    │       └── incremental_v2 (v1.2)
+    └── incremental_v2_direct (v1.1)  ← 另一条分支
+```
+
+- `base_checkpoint_id = NULL` 表示预训练版本（种子节点）
+- `base_checkpoint_id` 指向父 checkpoint 的 `id`
+- `status='published'` 且 `is_published=1` 表示当前 API 服务使用的版本
+
+### 8.3 注册流程（种子脚本）
+
+```bash
+# 通过 WEB 界面操作
+# 路径: /model-manager → 模型管理 → 注册新模型
+#
+# 或通过数据库直接操作:
+python -c "
+import aiosqlite, asyncio
+async def register():
+    db = await aiosqlite.connect('app/data/training.db')
+    # 注册 CAM++ 定义
+    await db.execute('''INSERT OR IGNORE INTO model_definitions
+        (name, arch_version, code_path, python_class, code_hash, embedding_dim, feat_dim)
+        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+        ('CAM++', 'v1', 'pytorch/model/cam++.py', 'CAMPlus',
+         hashlib.sha256(open('pytorch/model/cam++.py','rb').read()).hexdigest()[:16],
+         192, 80))
+    # 创建初始 checkpoint
+    await db.execute('''INSERT OR IGNORE INTO checkpoints
+        (model_def_id, model_name, version_tag, status, embedding_dim, is_published)
+        VALUES ((SELECT id FROM model_definitions WHERE name=?), ?, ?, 'done', 192, 1)''',
+        ('CAM++', 'CAM++', 'v1.0'))
+    await db.commit()
+asyncio.run(register())
+"
+```
+
+---
+
+## 9. 打标生命周期与训练就绪状态
+
+**数据库表：** `segment_label_history`、`audio_segments.trained_status`
+
+### 9.1 片段标签状态机
+
+```
+                  ┌────────────────────────────┐
+                  │  untrained (初始/默认状态)   │
+                  │  — 已打标但未用于训练         │
+                  └────────────┬───────────────┘
+                               │
+                  ┌────────────▼───────────────┐
+            ┌────►│  training                    │
+            │     │  — 正在被训练器消费          │
+            │     └────────────┬───────────────┘
+            │                  │
+            │     ┌────────────▼───────────────┐
+            │     │  trained                     │
+            │     │  — 已被某次训练使用          │
+            │     └────────────┬───────────────┘
+            │                  │
+            │     (用户重新打标)
+            │                  │
+            └─────────────────┘
+               → 重置为 untrained
+```
+
+- `trained_status` 列在 `audio_segments` 表中
+- 当用户**修改已打标片段**的标签时 → 自动重置为 `untrained`
+- 训练器开始训练前 → 将消费的片段设为 `training`
+- 训练成功完成后 → 将消费的片段设为 `trained`
+- `count_labeled_segments_for_speakers()` 返回 `untrained` 计数，用于首页统计
+
+### 9.2 打标历史日志
+
+```sql
+TABLE segment_label_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id      INTEGER NOT NULL REFERENCES audio_segments(id),
+    old_label       TEXT    NOT NULL DEFAULT '',
+    new_label       TEXT    NOT NULL DEFAULT '',
+    old_speaker_type TEXT   NOT NULL DEFAULT '',
+    new_speaker_type TEXT   NOT NULL DEFAULT '',
+    old_ignored     INTEGER NOT NULL DEFAULT 0,
+    new_ignored     INTEGER NOT NULL DEFAULT 0,
+    operated_by     TEXT    NOT NULL DEFAULT 'admin',
+    label_source    TEXT    NOT NULL DEFAULT 'manual',  -- manual | auto
+    auto_reason     TEXT,           -- 自动打标的理由（相似度分数等）
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+)
+```
+
+示例日志记录：
+
+| segment_id | old_label | new_label | label_source | auto_reason |
+|-----------|-----------|-----------|-------------|-------------|
+| 123 | "" | "AGENT_TELE" | manual | — |
+| 123 | "AGENT_TELE" | "075582095333" | manual | — |
+| 456 | "" | "@agent_755" | auto | "坐席 ID: 755, 声学特征匹配, 置信度: 0.85" |
+| 456 | "@agent_755" | "__noise__" | manual | — |
+
+### 9.3 训练器消费流程
+
+```python
+# 伪代码：增量训练中的片段消费
+# 1. 查询未训练的片段
+segments = db.get_untrained_segments_for_model(model_name)
+
+# 2. 标记为 training
+for seg in segments:
+    db.update_trained_status(seg.id, 'training')
+
+# 3. 执行训练
+try:
+    trainer.train(model, segments)
+    # 标记为 trained
+    for seg in segments:
+        db.update_trained_status(seg.id, 'trained')
+except Exception:
+    for seg in segments:
+        db.update_trained_status(seg.id, 'untrained')
+```
+
+---
+
+## 10. ONNX 部署映射
+
+### 10.1 PyTorch ↔ ONNX 版本对应
+
+| 模型 | Embedding 维 | ONNX 文件名 | ONNX 输入名 | 输入形状 | 特征来源 | 输入归一化 |
+|------|------------|------------|------------|----------|---------|-----------|
+| CAM++ | 192 | `campplus.onnx` | `feats` | (1, T, 80) | FBank (torch) | log(x+eps) |
+| ECAPA-TDNN | 192 | `ecapa-speaker-v1.onnx` | `input` | (1, 1, 80, T) | FBank (torch) | log(x+eps) |
+| ResNet34 | 256 | `voxceleb_resnet34_LM.onnx` | `input.1` | (1, 1, 80, T) | FBank (torch) | log(x+eps) |
+
+### 10.2 ONNX 导出流程
+
+```
+PyTorch checkpoint (.pt/.pth)
+    │
+    ├─ torch.onnx.export()
+    │   └─ 动态 batch size
+    │   └─ opset_version=15
+    │   └─ input_names / output_names 固定
+    │
+    └─ saved to: app/api/models/{model_name}.onnx
+```
+
+### 10.3 部署切换
+
+通过 WEB 界面 ("模型发布" 页面) 完成：
+
+1. 用户选择某个 checkpoint → 点击 "发布"
+2. 系统自动：
+   - 将 checkpoint 对应的 ONNX 文件复制到 `api/models/` 目录
+   - 更新 `checkpoints.is_published` 为 1（旧发布版本置为 0）
+   - ONNX Runtime inference session 热加载（FileWatcher 每 30s 扫描）
+3. 新版本立即生效，旧版本保留在磁盘上供回滚
+
+### 10.4 热加载机制
+
+```python
+# app/api/services/verifier.py
+class OnnxModel:
+    def __init__(self):
+        self._sessions: Dict[str, ort.InferenceSession] = {}
+        # FileWatcher 每 30s 监控 api/models/*.onnx 的 mtime
+        # 文件变更时自动重新创建 session，无中断切换
+```
+
+---
+
+## 11. WEB API 架构总览
+
+### 11.1 系统组件关系
+
+```
+┌──────────────────────── WEB 层 ────────────────────────┐
+│  FastAPI + Jinja2 模板                                   │
+│  ├─ app/api/routers/auth_router.py      登录/认证       │
+│  ├─ app/api/routers/model_manager_router.py 模型管理员   │
+│  │   ├─ 首页                          →  dashboard stats│
+│  │   ├─ 录音断句 (segments)           →  VAD + 片段管理  │
+│  │   ├─ 说话人打标 (label)            →  手动/自动打标   │
+│  │   ├─ 增量训练 (train)             →  触发训练         │
+│  │   └─ 模型管理 (model)            →  注册/发布         │
+│  └─ app/api/routers/api_router.py    REST API           │
+├────────────────────── 业务逻辑层 ──────────────────────┤
+│  app/api/services/                                       │
+│  ├─ recording_db.py    所有 SQLite CRUD 操作            │
+│  ├─ verifier.py        ONNX Runtime 推理                │
+│  └─ auth.py            认证/角色管理                    │
+├────────────────────── 数据库层 ────────────────────────┤
+│  app/data/database.py  SQLite schema + 迁移             │
+│  app/data/training.db  运行时数据库                      │
+├────────────────────── 训练层 ──────────────────────────┤
+│  app/train/                                             │
+│  ├─ fine_tune.py         模型定义 + 训练循环            │
+│  ├─ trainer.py           增量训练调度                   │
+│  ├─ preprocess.py        预处理流水线                   │
+│  ├─ vad.py               VAD 断句                       │
+│  ├─ diarizer.py          说话人聚类                     │
+│  ├─ evaluate.py          评估                           │
+│  ├─ model_manager.py     ONNX 导出 + 版本管理           │
+│  ├─ evaluator.py         对比评估                       │
+│  ├─ incremental_train.py 增量训练入口                   │
+│  └─ db.py                训练用 SQLite CRUD             │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 11.2 数据流
+
+```
+录音上传 (通过 API 或 WEB)
+    │
+    ├─ 写入 training.db (recordings 表)
+    ├─ 保存 WAV 到磁盘
+    │
+    ▼
+VAD 断句 (WEB: /model-manager/segments)
+    │
+    ├─ 读取 WAV → energy_vad → 分片
+    ├─ 写入 audio_segments 表 + WAV 片段存储
+    │
+    ▼
+说话人打标 (WEB: /model-manager/label)
+    │
+    ├─ 手动: 下拉选已有说话人 / 输入新 ID / 设为噪音
+    ├─ 自动: ONNX 模型推理 → 预览 → 确认
+    └─ 写入 segment_label_history
+    └─ trained_status = untrained
+    │
+    ▼
+增量训练 (WEB: /model-manager/train)
+    │
+    ├─ 读取 untrained 片段
+    ├─ 读取 base checkpoint
+    ├─ 训练 → 新 checkpoint
+    ├─ 评估 → 对比报告
+    └─ 注册到 checkpoints 表
+    │
+    ▼
+模型发布 (WEB: /model-manager/publish)
+    │
+    ├─ 导出 ONNX → api/models/
+    ├─ 标记 is_published=1
+    └─ verifier.py 热加载
+```
+
+---
+
+## 附录 C：数据库表关系图
+
+```
+recordings
+    │              ┌────────────────────────────────────┐
+    ├─── 1:N ───► audio_segments                        │
+    │               ├─ recording_id (FK → recordings.id)│
+    │               ├─ segment_index (int)              │
+    │               ├─ start_sec / end_sec / duration   │
+    │               ├─ speaker_label                    │
+    │               ├─ speaker_type                     │
+    │               ├─ label_source (manual / auto)     │
+    │               ├─ is_ignored (0/1)                 │
+    │               ├─ trained_status                   │
+    │               │   (untrained/training/trained)    │
+    │               └─ batch_version                    │
+    │                                                    │
+    ├─── 1:N ───► segment_label_history                 │
+    │               ├─ segment_id (FK)                  │
+    │               ├─ old_label / new_label            │
+    │               ├─ operator / label_source          │
+    │               └─ auto_reason                      │
+    │                                                    │
+model_definitions                                        │
+    │                                                    │
+    └─── 1:N ───► checkpoints                           │
+                    ├─ model_def_id (FK)                │
+                    ├─ base_checkpoint_id (FK → self)   │
+                    ├─ status / metrics / is_published  │
+                    └─ file_path                        │
+                         │                              │
+                         └─── M:N ───► segment_label_history
+                                       (checkpoint_training_segments 表)
+```
+
+---
+
+*本文档最后更新：2026-06-22*
+*对应标号 6 功能：首页统计 / Segments 页面 / 说话人打标页 / 增量训练 / 模型管理*

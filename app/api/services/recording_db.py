@@ -13,7 +13,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("asv-api.recording_db")
 
@@ -699,6 +699,70 @@ async def list_recordings_with_segments(
         await conn.close()
 
 
+async def list_recordings_with_segments_paginated(
+    agent_id: str = "",
+    customer_phone: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    status_filter: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    db_path: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """分页查询录音列表，返回 (recordings, total_count)。"""
+    conditions = ["1=1"]
+    params: List[Any] = []
+
+    if agent_id:
+        conditions.append("r.agent_id = ?")
+        params.append(agent_id)
+    if customer_phone:
+        conditions.append("r.customer_phone = ?")
+        params.append(customer_phone)
+    if date_from:
+        conditions.append("r.call_timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("r.call_timestamp <= ?")
+        params.append(date_to + " 23:59:59")
+    if status_filter == "pending_segment":
+        conditions.append("r.pre_status = 'done'")
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
+        )
+    elif status_filter == "segmented":
+        conditions.append(
+            "EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
+        )
+    elif status_filter:
+        conditions.append("r.pre_status = ?")
+        params.append(status_filter)
+
+    conn = await _open_conn(db_path)
+    try:
+        # 总计数
+        cursor = await conn.execute(
+            f"SELECT COUNT(*) FROM recordings r WHERE {' AND '.join(conditions)}",
+            params,
+        )
+        total_count = (await cursor.fetchone())[0]
+
+        # 分页数据
+        cursor = await conn.execute(
+            f"SELECT r.*, "
+            f"(SELECT COUNT(*) FROM audio_segments s WHERE s.recording_id = r.id) AS seg_count, "
+            f"(SELECT COUNT(*) FROM audio_segments s WHERE s.recording_id = r.id AND s.is_ignored = 1) AS seg_ignored, "
+            f"(SELECT s2.batch_id FROM audio_segments s2 WHERE s2.recording_id = r.id ORDER BY s2.id DESC LIMIT 1) AS latest_batch "
+            f"FROM recordings r WHERE {' AND '.join(conditions)} "
+            f"ORDER BY r.id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        return rows, total_count
+    finally:
+        await conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Model Versions — training version metadata
 # --------...[truncated]# but heredocs aren't working...
@@ -1104,3 +1168,194 @@ async def get_multi_period_call_stats(db_path: Optional[str] = None) -> dict:
         "last_7d": await get_api_call_stats(7, db_path),
         "last_30d": await get_api_call_stats(30, db_path),
     }
+
+
+# ---------------------------------------------------------------------------
+# Segment labeling — history tracking & stats
+# ---------------------------------------------------------------------------
+
+
+async def log_segment_label_change(
+    segment_id: int,
+    *,
+    old_label: str = "",
+    new_label: str = "",
+    old_type: str = "",
+    new_type: str = "",
+    old_ignored: int = 0,
+    new_ignored: int = 0,
+    operated_by: str = "",
+    auto_reason: str = "",
+    db_path: Optional[str] = None,
+) -> int:
+    """记录一次片段标签变更历史。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO segment_label_history
+               (segment_id, old_label, new_label, old_type, new_type,
+                old_ignored, new_ignored, operated_by, auto_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (segment_id, old_label, new_label, old_type, new_type,
+             old_ignored, new_ignored, operated_by, auto_reason),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def get_segment_by_id(
+    segment_id: int,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """获取单个片段详情。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM audio_segments WHERE id = ?", (segment_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def get_segment_label_history(
+    segment_id: int,
+    limit: int = 50,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """获取指定片段的标签变更历史。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM segment_label_history "
+            "WHERE segment_id = ? ORDER BY id DESC LIMIT ?",
+            (segment_id, limit),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def get_segment_stats(db_path: Optional[str] = None) -> Dict[str, int]:
+    """获取录音断句/打标汇总统计（用于 segments 页面顶部指标栏）。
+
+    Returns:
+        dict with keys:
+          total_recordings   — 总录音数（已预处理完成的）
+          segmented          — 已断句录音数
+          labeled            — 已打标片段数
+          unsegmented        — 未断句录音数（已预处理但无片段）
+          unlabeled          — 未打标片段数
+    """
+    conn = await _open_conn(db_path)
+    try:
+        stats: Dict[str, int] = {}
+
+        # 总录音数（已预处理完成）
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'done'"
+        )
+        stats["total_recordings"] = (await cur.fetchone())["cnt"]
+
+        # 已断句（有片段数据的录音数）
+        cur = await conn.execute(
+            "SELECT COUNT(DISTINCT recording_id) AS cnt FROM audio_segments"
+        )
+        stats["segmented"] = (await cur.fetchone())["cnt"]
+
+        # 未断句（已预处理但无片段）
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings r "
+            "WHERE r.pre_status = 'done' AND NOT EXISTS ("
+            "  SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id"
+            ")"
+        )
+        stats["unsegmented"] = (await cur.fetchone())["cnt"]
+
+        # 已打标片段
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE speaker_label IS NOT NULL AND speaker_label != '' "
+            "AND (is_ignored IS NULL OR is_ignored = 0)"
+        )
+        stats["labeled"] = (await cur.fetchone())["cnt"]
+
+        # 未打标片段
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE (speaker_label IS NULL OR speaker_label = '') "
+            "AND (is_ignored IS NULL OR is_ignored = 0)"
+        )
+        stats["unlabeled"] = (await cur.fetchone())["cnt"]
+
+        return stats
+    finally:
+        await conn.close()
+
+
+async def update_segment_trained_status(
+    segment_ids: List[int],
+    status: str = "trained",
+    db_path: Optional[str] = None,
+) -> int:
+    """批量更新片段的训练状态。
+
+    Args:
+        segment_ids: 片段 ID 列表
+        status: 'untrained' | 'training' | 'trained'
+    Returns:
+        更新的行数
+    """
+    if not segment_ids:
+        return 0
+    conn = await _open_conn(db_path)
+    try:
+        placeholders = ",".join("?" for _ in segment_ids)
+        cursor = await conn.execute(
+            f"UPDATE audio_segments SET trained_status = ? "
+            f"WHERE id IN ({placeholders})",
+            [status] + segment_ids,
+        )
+        await conn.commit()
+        return cursor.rowcount
+    finally:
+        await conn.close()
+
+
+async def list_speakers_from_segments(
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """从已打标片段中提取说话人列表（去重）。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT speaker_label AS speaker_id, COUNT(*) AS seg_count, "
+            "speaker_type, MAX(created_at) AS last_labeled "
+            "FROM audio_segments "
+            "WHERE speaker_label IS NOT NULL AND speaker_label != '' "
+            "AND (is_ignored IS NULL OR is_ignored = 0) "
+            "GROUP BY speaker_label ORDER BY seg_count DESC"
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def count_labeled_segments_for_speakers(
+    db_path: Optional[str] = None,
+) -> int:
+    """统计涉及已打标说话人的片段数（跟 labeled_speakers 配合展示）。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audio_segments "
+            "WHERE speaker_label IS NOT NULL AND speaker_label != '' "
+            "AND (is_ignored IS NULL OR is_ignored = 0) "
+            "AND trained_status = 'untrained'"
+        )
+        return (await cursor.fetchone())["cnt"]
+    finally:
+        await conn.close()

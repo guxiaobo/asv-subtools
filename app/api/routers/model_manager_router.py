@@ -244,6 +244,8 @@ async def segment_manager_page(
     date_from: str = "",
     date_to: str = "",
     status: str = "",
+    page: int = 1,
+    per_page: int = 50,
 ):
     """录音断句管理页面。"""
     await require_role(ROLE_MODEL_MANAGER)(request)
@@ -254,19 +256,26 @@ async def segment_manager_page(
     vad_cfg = _load_vad_config()
 
     recordings = []
-    pending_count = 0
+    total_count = 0
     try:
-        recordings = await db.list_recordings_with_segments(
-            agent_id=agent_id,
-            customer_phone=customer_phone,
-            date_from=date_from,
-            date_to=date_to,
-            status_filter=status,
-            limit=200,
-        )
-        pending_count = await db.count_pending_segment_recordings()
+        # 仅当设置了筛选条件时加载录音列表
+        has_filter = bool(agent_id or customer_phone or date_from or date_to or status)
+        if has_filter:
+            offset_val = (page - 1) * per_page
+            recordings, total_count = await db.list_recordings_with_segments_paginated(
+                agent_id=agent_id,
+                customer_phone=customer_phone,
+                date_from=date_from,
+                date_to=date_to,
+                status_filter=status,
+                limit=per_page,
+                offset=offset_val,
+            )
+        seg_stats = await db.get_segment_stats()
     except Exception as e:
         logger.error("Failed to load recordings: %s", e)
+        seg_stats = {"total_recordings": 0, "segmented": 0,
+                     "labeled": 0, "unsegmented": 0, "unlabeled": 0}
 
     # Get agent list for filter dropdown
     agents = []
@@ -275,14 +284,18 @@ async def segment_manager_page(
     except Exception:
         pass
 
-    page = _render_segment_page(user, recordings, pending_count, agents, vad_cfg,
-                                agent_id, customer_phone, date_from, date_to, status)
+    total_pages = max(1, (total_count + per_page - 1) // per_page) if total_count else 1
+
+    page = _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
+                                agent_id, customer_phone, date_from, date_to, status,
+                                page, total_pages, total_count, bool(agent_id or customer_phone or date_from or date_to or status))
     return HTMLResponse(page)
 
 
-def _render_segment_page(user, recordings, pending_count, agents, vad_cfg,
-                         agent_id, customer_phone, date_from, date_to, status):
-    """渲染录音断句页面 HTML。"""
+def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
+                         agent_id, customer_phone, date_from, date_to, status,
+                         current_page, total_pages, total_count, has_filter):
+    """渲染录音断句页面 HTML（含分页、筛选、多选断句）。"""
     user = user or {}
     rows_html = ""
     for rec in recordings:
@@ -298,7 +311,9 @@ def _render_segment_page(user, recordings, pending_count, agents, vad_cfg,
         if seg_ignored > 0:
             seg_info += f' <span style="color:#e74c3c">({seg_ignored} 忽略)</span>'
 
+        can_segment = pre_status == "done"
         rows_html += f"""<tr>
+            <td><input type="checkbox" class="rec-check" value="{rec['id']}" data-status="{pre_status}" {"" if can_segment else "disabled"}></td>
             <td>{rec.get('id','')}</td>
             <td>{rec.get('agent_id','')}</td>
             <td>{rec.get('customer_phone','')}</td>
@@ -308,18 +323,30 @@ def _render_segment_page(user, recordings, pending_count, agents, vad_cfg,
             <td>{seg_info}</td>
             <td>
                 <a href="/model-manager/segments/{rec['id']}?batch={batch}" class="btn-sm" style="background:#3498db">查看片段</a>
-                {"<span class='btn-sm' style='background:#95a5a6;cursor:default'>请先 VAD 预处理</span>" if pre_status != 'done' else ""}
+                {"" if can_segment else "<span class='btn-sm' style='background:#95a5a6;cursor:default'>预处</span>"}
             </td>
         </tr>"""
 
-    if not recordings:
-        rows_html = "<tr><td colspan='8' style='text-align:center;color:#999;padding:30px'>暂无录音数据</td></tr>"
+    if not recordings and has_filter:
+        rows_html = "<tr><td colspan='9' style='text-align:center;color:#999;padding:30px'>无匹配录音</td></tr>"
 
-    # Agent options
+    # Agent filter options
     agent_opts = '<option value="">全部坐席</option>'
     for a in agents:
         sel = 'selected' if a.get('agent_id','') == agent_id else ''
         agent_opts += f'<option value="{a["agent_id"]}" {sel}>{a.get("display_name","") or a["agent_id"]}</option>'
+
+    # Pagination
+    pag_html = ""
+    if has_filter and total_pages > 1:
+        qs = f"agent_id={agent_id}&customer_phone={customer_phone}&date_from={date_from}&date_to={date_to}&status={status}"
+        prev_dis = "disabled" if current_page <= 1 else ""
+        next_dis = "disabled" if current_page >= total_pages else ""
+        pag_html = f"""<div class="pagination">
+            <a href="/model-manager/segments?{qs}&page={current_page-1}&per_page=50" class="btn {"btn-disabled" if prev_dis else "btn-primary"}" {prev_dis}>← 上一页</a>
+            <span class="page-info">第 {current_page}/{total_pages} 页（共 {total_count} 条）</span>
+            <a href="/model-manager/segments?{qs}&page={current_page+1}&per_page=50" class="btn {"btn-disabled" if next_dis else "btn-primary"}" {next_dis}>下一页 →</a>
+        </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -342,26 +369,21 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 .btn {{ padding:7px 16px; border:none; border-radius:5px; cursor:pointer; font-size:13px; text-decoration:none; display:inline-block }}
 .btn-primary {{ background:#3498db; color:#fff }}
 .btn-primary:hover {{ background:#2980b9 }}
+.btn-primary:disabled {{ background:#95a5a6; cursor:default }}
 .btn-danger {{ background:#e74c3c; color:#fff }}
 .btn-success {{ background:#27ae60; color:#fff }}
 .btn-sm {{ padding:4px 10px; border:none; border-radius:4px; cursor:pointer; font-size:12px; color:#fff; text-decoration:none; display:inline-block }}
-.btn-disabled {{ background:#95a5a6; cursor:default; padding:4px 10px; border-radius:4px; font-size:12px; color:#fff; display:inline-block }}
+.btn-disabled {{ background:#95a5a6 !important; cursor:default !important; padding:7px 16px; border:none; border-radius:5px; font-size:13px; color:#fff !important; display:inline-block; text-decoration:none }}
 table {{ width:100%; border-collapse:collapse }}
 th {{ background:#f8f9fa; padding:10px 8px; text-align:left; font-size:13px; font-weight:600; border-bottom:2px solid #dee2e6 }}
 td {{ padding:8px; font-size:13px; border-bottom:1px solid #eee }}
 tr:hover {{ background:#f8f9fa }}
-.msg {{ padding:10px 16px; border-radius:6px; margin-bottom:16px; font-size:14px }}
-.msg.success {{ background:#d4edda; color:#155724; border:1px solid #c3e6cb }}
-.msg.error {{ background:#f8d7da; color:#721c24; border:1px solid #f5c6cb }}
-.badge {{ display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold }}
-.badge-orange {{ background:#fef3cd; color:#856404 }}
-.badge-blue {{ background:#cfe2ff; color:#0a58ca }}
-.badge-green {{ background:#d4edda; color:#155724 }}
-.badge-red {{ background:#f8d7da; color:#721c24 }}
-.summary-row {{ display:flex; gap:20px; margin-bottom:16px }}
-.summary-item {{ flex:1; text-align:center; padding:16px; border-radius:8px; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.1) }}
-.summary-num {{ font-size:28px; font-weight:bold; color:#2c3e50 }}
+.summary-row {{ display:flex; gap:12px; margin-bottom:16px }}
+.summary-item {{ flex:1; text-align:center; padding:14px; border-radius:8px; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.1) }}
+.summary-num {{ font-size:26px; font-weight:bold; color:#2c3e50 }}
 .summary-label {{ font-size:12px; color:#777; margin-top:4px }}
+.pagination {{ display:flex; align-items:center; justify-content:center; gap:12px; margin-top:16px; padding:12px 0 }}
+.page-info {{ font-size:13px; color:#666 }}
 </style></head>
 <body>
 <div class="nav">
@@ -375,26 +397,30 @@ tr:hover {{ background:#f8f9fa }}
 <div class="container">
     <div class="summary-row">
         <div class="summary-item">
-            <div class="summary-num">{len(recordings)}</div>
+            <div class="summary-num">{seg_stats.get("total_recordings",0)}</div>
             <div class="summary-label">总录音数</div>
         </div>
         <div class="summary-item">
-            <div class="summary-num">{pending_count}</div>
-            <div class="summary-label">待断句</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-num">{sum(1 for r in recordings if r.get('seg_count',0)>0)}</div>
+            <div class="summary-num">{seg_stats.get("segmented",0)}</div>
             <div class="summary-label">已断句</div>
         </div>
         <div class="summary-item">
-            <div class="summary-num">{sum(1 for r in recordings if r.get('seg_count',0)>0 and r.get('seg_ignored',0)==0)}</div>
+            <div class="summary-num">{seg_stats.get("labeled",0)}</div>
             <div class="summary-label">已打标</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-num" style="color:{'#e67e22' if seg_stats.get('unsegmented',0)>0 else '#27ae60'}">{seg_stats.get("unsegmented",0)}</div>
+            <div class="summary-label">未断句</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-num" style="color:{'#dc2626' if seg_stats.get('unlabeled',0)>0 else '#16a34a'}">{seg_stats.get("unlabeled",0)}</div>
+            <div class="summary-label">未打标</div>
         </div>
     </div>
 
     <div class="card">
         <h2>录音断句</h2>
-        <form method="get" action="/model-manager/segments" class="filter-row">
+        <form method="get" action="/model-manager/segments" class="filter-row" id="filterForm">
             <div>
                 <label style="display:block">坐席</label>
                 <select name="agent_id">{agent_opts}</select>
@@ -423,32 +449,68 @@ tr:hover {{ background:#f8f9fa }}
                 </select>
             </div>
             <div>
-                <button type="submit" class="btn btn-primary">筛选</button>
-                <a href="/model-manager/segments" class="btn btn-primary" style="background:#95a5a6">重置</a>
+                <button type="submit" class="btn btn-primary" style="margin-top:18px">🔍 筛选</button>
+                <a href="/model-manager/segments" class="btn btn-primary" style="background:#95a5a6;margin-top:18px">重置</a>
             </div>
         </form>
 
-        <div style="margin-bottom:12px;display:flex;gap:8px">
-            <button class="btn btn-success" onclick="runVad()">开始断句（处理待处理录音）</button>
+        <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-success" id="runVadBtn" onclick="runVad()" disabled>⏳ 开始断句（选中后激活）</button>
+            <span style="font-size:12px;color:#999">勾选待断句录音后激活按钮</span>
         </div>
 
         <table>
             <thead>
-                <tr><th>ID</th><th>坐席</th><th>客户</th><th>时间</th><th>文件名</th><th>VAD状态</th><th>断句</th><th>操作</th></tr>
+                <tr>
+                    <th style="width:36px"><input type="checkbox" id="checkAll" onchange="toggleAll()"></th>
+                    <th>ID</th><th>坐席</th><th>客户</th><th>时间</th><th>文件名</th><th>VAD状态</th><th>断句</th><th>操作</th>
+                </tr>
             </thead>
-            <tbody>{rows_html}</tbody>
+            <tbody>{rows_html if has_filter else '<tr><td colspan="9" style="text-align:center;color:#999;padding:40px">请在上方设置筛选条件后点击 <strong>🔍 筛选</strong> 查看录音清单</td></tr>'}</tbody>
         </table>
+
+        {pag_html}
     </div>
 </div>
 <script>
+document.querySelectorAll('.rec-check').forEach(function(cb) {{
+    cb.addEventListener('change', updateVadBtn);
+}});
+
+function updateVadBtn() {{
+    var checked = document.querySelectorAll('.rec-check:checked:not(:disabled)');
+    var btn = document.getElementById('runVadBtn');
+    if (checked.length > 0) {{
+        btn.disabled = false;
+        btn.textContent = '🔊 开始断句（已选 ' + checked.length + ' 条）';
+    }} else {{
+        btn.disabled = true;
+        btn.textContent = '⏳ 开始断句（选中后激活）';
+    }}
+}}
+
+function toggleAll() {{
+    var all = document.getElementById('checkAll').checked;
+    document.querySelectorAll('.rec-check:not(:disabled)').forEach(function(cb) {{ cb.checked = all; }});
+    updateVadBtn();
+}}
+
 async function runVad() {{
-    if (!confirm('确定要对所有待 VAD 预处理的录音执行断句吗？')) return;
-    const btn = event.target; btn.disabled = true; btn.textContent = '处理中...';
+    var checked = document.querySelectorAll('.rec-check:checked:not(:disabled)');
+    var ids = Array.from(checked).map(function(cb) {{ return parseInt(cb.value); }});
+    if (ids.length === 0) {{ alert('请先选择待断句的录音'); return; }}
+    if (!confirm('确定对选中的 ' + ids.length + ' 条录音执行断句吗？')) return;
+    var btn = document.getElementById('runVadBtn');
+    btn.disabled = true; btn.textContent = '处理中...';
     try {{
-        const resp = await fetch('/model-manager/run-preprocess', {{ method:'POST' }});
-        const result = await resp.json();
+        var resp = await fetch('/model-manager/run-preprocess', {{
+            method:'POST',
+            headers:{{'Content-Type':'application/json'}},
+            body:JSON.stringify({{recording_ids: ids}})
+        }});
+        var result = await resp.json();
         if (result.success) {{
-            alert('断句任务已启动: ' + result.message);
+            alert('断句任务已启动: ' + (result.message || ''));
             location.reload();
         }} else {{
             alert('启动失败: ' + (result.error || JSON.stringify(result)));
@@ -505,7 +567,14 @@ async def recording_segments_page(
     if not recording:
         return HTMLResponse("<h1>录音不存在</h1><a href='/model-manager/segments'>返回</a>", status_code=404)
 
-    return HTMLResponse(_render_recording_detail(user, recording, segments, batches, batch, recording_id))
+    # Get existing speakers for dropdown
+    existing_speakers = []
+    try:
+        existing_speakers = await db.list_speakers_from_segments()
+    except Exception as e:
+        logger.error("Failed to load speakers: %s", e)
+
+    return HTMLResponse(_render_recording_detail(user, recording, segments, batches, batch, recording_id, existing_speakers))
 
 
 @router.get("/model-manager/evaluate", response_class=HTMLResponse)
@@ -514,9 +583,20 @@ async def evaluate_redirect(request: Request):
     return RedirectResponse(url="/model-manager", status_code=302)
 
 
-def _render_recording_detail(user, recording, segments, batches, current_batch, recording_id):
+def _render_recording_detail(user, recording, segments, batches, current_batch, recording_id, existing_speakers=None):
     """渲染录音详情页（含片段列表）。"""
     user = user or {}
+    existing_speakers = existing_speakers or []
+
+    # Build speaker dropdown options from existing speakers
+    speaker_opts = '<option value="">-- 选择已有说话人 --</option>'
+    for sp in existing_speakers:
+        label = sp.get("speaker_label", "") or sp.get("id", "")
+        sp_type = sp.get("speaker_type", "unknown")
+        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "未知"}.get(sp_type, sp_type)
+        speaker_opts += f'<option value="{label}">{label} ({sp_t})</option>'
+    speaker_opts += '<option value="__noise__">🔇 噪音/忽略</option>'
+
     seg_rows = ""
     for seg in segments:
         ignore_link = f"/model-manager/segments/{seg['id']}/toggle-ignore"
@@ -527,6 +607,8 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
         speaker_type = seg.get("speaker_type", "unknown")
         speaker_type_label = {"agent": "坐席", "customer": "客户", "unknown": "未知", "ignored": "已忽略"}.get(speaker_type, speaker_type)
 
+        current_label = seg.get('speaker_label', '') or speaker_type_label
+
         seg_rows += f"""<tr class="{seg_class}">
             <td>{seg.get('segment_index','')}</td>
             <td>{seg.get('start_sec',''):.1f}s</td>
@@ -536,13 +618,17 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
                 <button class="btn-sm" style="background:#2c3e50" onclick="playAudio('{seg['id']}')">▶ 播放</button>
             </td>
             <td>
-                <span id="label-{seg['id']}">{seg.get('speaker_label','') or speaker_type_label}</span>
+                <span id="label-{seg['id']}">{current_label}</span>
             </td>
             <td>
                 <a href="javascript:void(0)" onclick="toggleIgnore({seg['id']})" id="ignore-{seg['id']}" class="{ignore_btn_class}">{ignore_btn}</a>
             </td>
-            <td>
-                <input type="text" id="custom-label-{seg['id']}" placeholder="自定义标签" style="width:100px;padding:3px 6px;border:1px solid #ddd;border-radius:3px;font-size:12px">
+            <td style="max-width:220px">
+                <select id="sel-{seg['id']}" class="speaker-select" onchange="onSpeakerSelect({seg['id']})">
+                    {speaker_opts}
+                    <option value="__new__">✏️ 新说话人...</option>
+                </select>
+                <input type="text" id="new-{seg['id']}" placeholder="新说话人ID" style="width:90px;padding:3px 6px;border:1px solid #ddd;border-radius:3px;font-size:12px;display:none">
                 <button class="btn-sm" style="background:#8e44ad" onclick="setLabel({seg['id']})">设置</button>
             </td>
         </tr>"""
@@ -586,6 +672,7 @@ tr.seg-ignored td {{ color:#999; text-decoration:line-through }}
 .btn-sm-warning {{ background:#e67e22 !important }}
 audio {{ width:100%; margin-top:8px }}
 .batch-select {{ padding:6px 10px; border:1px solid #ddd; border-radius:5px; font-size:13px; margin-right:8px }}
+.speaker-select {{ padding:3px 6px; border:1px solid #ddd; border-radius:3px; font-size:12px; max-width:130px }}
 </style></head>
 <body>
 <div class="nav">
@@ -615,9 +702,8 @@ audio {{ width:100%; margin-top:8px }}
             <label>断句版本:</label>
             <select class="batch-select" onchange="switchBatch(this.value)">
                 {batch_opts}
-                <option value="__new__">+ 重新断句</option>
             </select>
-            <button class="btn btn-primary" onclick="reprocessRecording()">重新断句</button>
+            <button class="btn btn-primary" onclick="reprocessRecording()">🔁 重新断句</button>
         </div>
     </div>
 
@@ -628,7 +714,7 @@ audio {{ width:100%; margin-top:8px }}
         </div>
         <table>
             <thead>
-                <tr><th>序号</th><th>起始</th><th>结束</th><th>时长</th><th>播放</th><th>说话人</th><th>操作</th><th>自定义标签</th></tr>
+                <tr><th>序号</th><th>起始</th><th>结束</th><th>时长</th><th>播放</th><th>说话人</th><th>忽略</th><th>设置标签</th></tr>
             </thead>
             <tbody>{seg_rows}</tbody>
         </table>
@@ -653,31 +739,59 @@ async function toggleIgnore(segId) {{
     }} catch(e) {{ alert('网络错误: ' + e.message); }}
 }}
 
+function onSpeakerSelect(segId) {{
+    const sel = document.getElementById('sel-' + segId);
+    const newInput = document.getElementById('new-' + segId);
+    newInput.style.display = (sel.value === '__new__') ? 'inline-block' : 'none';
+}}
+
 async function setLabel(segId) {{
-    const input = document.getElementById('custom-label-' + segId);
-    const label = input.value.trim();
-    if (!label) return;
+    const sel = document.getElementById('sel-' + segId);
+    const newInput = document.getElementById('new-' + segId);
+    let label = '';
+    let speakerType = '';
+    
+    if (sel.value === '__new__') {{
+        label = newInput.value.trim();
+        if (!label) {{ alert('请输入新说话人ID'); return; }}
+    }} else if (sel.value === '__noise__') {{
+        label = '__noise__';
+        speakerType = 'ignored';
+    }} else if (sel.value) {{
+        label = sel.value;
+    }} else {{
+        return;
+    }}
+    
     try {{
         const resp = await fetch('/model-manager/segments/' + segId + '/label', {{ 
             method:'POST',
             headers:{{'Content-Type':'application/json'}},
-            body:JSON.stringify({{speaker_label: label, label_source: 'manual'}})
+            body:JSON.stringify({{
+                speaker_label: label,
+                label_source: 'manual',
+                speaker_type: speakerType,
+                update_trained_status: true
+            }})
         }});
         const result = await resp.json();
         if (result.success) {{
-            document.getElementById('label-' + segId).textContent = label;
-            input.value = '';
-        }} else alert('设置失败');
+            const displayLabel = label === '__noise__' ? '🔇 噪音' : label;
+            document.getElementById('label-' + segId).textContent = displayLabel;
+            sel.value = '';
+            newInput.style.display = 'none';
+            newInput.value = '';
+        }} else alert('设置失败: ' + (result.error || ''));
     }} catch(e) {{ alert('网络错误: ' + e.message); }}
 }}
 
 function switchBatch(batch) {{
-    if (batch === '__new__') return;
     location.href = '/model-manager/segments/{recording_id}?batch=' + batch;
 }}
 
 async function reprocessRecording() {{
     if (!confirm('确定要重新断句此录音吗？旧结果会被保留在新版本中。')) return;
+    const btn = event.target; btn.disabled = true; btn.textContent = '处理中...';
     try {{
         const resp = await fetch('/model-manager/run-preprocess', {{ 
             method:'POST',
@@ -686,8 +800,9 @@ async function reprocessRecording() {{
         }});
         const result = await resp.json();
         if (result.success) {{ alert('重新断句已启动'); location.reload(); }}
-        else alert('启动失败: ' + result.error);
-    }} catch(e) {{ alert('网络错误: ' + e.message); }}
+        else alert('启动失败: ' + (result.error || ''));
+        btn.disabled = false; btn.textContent = '🔁 重新断句';
+    }} catch(e) {{ alert('网络错误: ' + e.message); btn.disabled = false; btn.textContent = '🔁 重新断句'; }}
 }}
 </script>
 </body>
@@ -760,33 +875,81 @@ async def toggle_segment_ignore(seg_id: int):
 
 @router.post("/model-manager/segments/{seg_id}/label")
 async def label_segment(seg_id: int, request: Request):
-    """手动设置片段标签。"""
+    """手动设置片段标签，支持已有说话人/新说话人/噪音，记录打标历史。"""
     db = _recordings_db()
     try:
         data = await request.json()
         speaker_label = data.get("speaker_label", "")
         label_source = data.get("label_source", "manual")
         speaker_type = data.get("speaker_type", "")
+        update_trained = data.get("update_trained_status", False)
+
+        # Handle "__noise__" — mark as ignored
+        if speaker_label == "__noise__":
+            await db.update_segment_label(
+                seg_id,
+                speaker_label="",
+                speaker_type="ignored",
+                label_source=label_source,
+            )
+            await db.set_segment_ignored(seg_id, ignored=True)
+            # Log
+            await db.log_segment_label_change(
+                segment_id=seg_id,
+                old_label="",
+                new_label="__noise__",
+                old_ignored=0,
+                new_ignored=1,
+                operated_by="admin",
+            )
+            return {"success": True}
+
+        # Get current label for history
+        old_seg = await db.get_segment_by_id(seg_id)
+
         await db.update_segment_label(
             seg_id,
             speaker_label=speaker_label,
             speaker_type=speaker_type,
             label_source=label_source,
         )
+
+        # If user changed the label, reset trained_status
+        if update_trained:
+            conn = await db._open_conn()
+            try:
+                await conn.execute(
+                    "UPDATE audio_segments SET trained_status = 'untrained' WHERE id = ?",
+                    (seg_id,),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        # Log label change
+        old_label = (old_seg or {}).get("speaker_label", "")
+        await db.log_segment_label_change(
+            segment_id=seg_id,
+            old_label=old_label,
+            new_label=speaker_label,
+            operated_by="admin",
+        )
+
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 # ---------------------------------------------------------------------------
 # l14: 说话人打标页面
-# ---------------------------------------------------------------------------
-
 @router.get("/model-manager/label", response_class=HTMLResponse)
 async def label_speakers_page(
     request: Request,
     speaker_type: str = "",
     label_status: str = "",
     segment_limit: int = 200,
+    model_name: str = "",
+    checkpoint_id: str = "",
 ):
+    """说话人打标页面：支持手动选说话人/新说话人 + 模型自动打标预览。"""
     await require_role(ROLE_MODEL_MANAGER)(request)
     user = request.state.current_user
     db = _recordings_db()
@@ -814,6 +977,53 @@ async def label_speakers_page(
         except Exception:
             pass
 
+    # Get existing speakers + available checkpoints
+    existing_speakers = []
+    checkpoints = []
+    try:
+        existing_speakers = await db.list_speakers_from_segments()
+        cps = await db.list_checkpoints(limit=50)
+        for cp in cps:
+            if cp.get("status") in ("done", "published"):
+                checkpoints.append(cp)
+    except Exception as e:
+        logger.error("label page data: %s", e)
+
+    # Build model + version selectors
+    model_opts = '<option value="">-- 选择模型 --</option>'
+    cp_opts = '<option value="">-- 选择版本 --</option>'
+    seen_models = set()
+    for cp in checkpoints:
+        mn = cp.get("model_name", "")
+        if mn and mn not in seen_models:
+            seen_models.add(mn)
+            sel = 'selected' if model_name == mn else ''
+            model_opts += f'<option value="{mn}" {sel}>{mn}</option>'
+
+    cp_info = []
+    for cp in checkpoints:
+        if model_name and cp.get("model_name") != model_name:
+            continue
+        vt = cp.get("version_tag", "") or f"v{cp.get('id','')}"
+        sel = 'selected' if str(cp.get("id","")) == checkpoint_id else ''
+        cp_opts += f'<option value="{cp["id"]}" data-model="{cp.get("model_name","")}" {sel}>{cp["id"]} - {cp.get("model_name","")} ({vt})</option>'
+        cp_info.append({
+            "id": cp["id"],
+            "model_name": cp.get("model_name", ""),
+            "version_tag": vt,
+            "file_path": cp.get("file_path", ""),
+            "embedding_dim": cp.get("embedding_dim", 192),
+        })
+
+    # Build speaker dropdown from existing speakers
+    speaker_opts = '<option value="">-- 选择 --</option>'
+    for sp in existing_speakers:
+        label = sp.get("speaker_label", "") or sp.get("id", "")
+        sp_type = sp.get("speaker_type", "unknown")
+        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "未知"}.get(sp_type, sp_type)
+        speaker_opts += f'<option value="{label}">{label} ({sp_t})</option>'
+    speaker_opts += '<option value="__noise__">🔇 噪音/忽略</option>'
+
     rows = ""
     for seg in all_segments:
         rec = seg.get("recording_info", {})
@@ -821,6 +1031,19 @@ async def label_speakers_page(
             seg.get("speaker_type", ""), "#95a5a6"
         )
         lbl = seg.get("speaker_label") or "—"
+        sid = seg["id"]
+        is_ignored = seg.get("is_ignored", 0)
+        ts_label = seg.get("trained_status", "")
+        ts_badge = ""
+        if ts_label == "trained":
+            ts_badge = '<span style="color:#27ae60;font-size:10px">✓已训练</span>'
+        elif ts_label == "training":
+            ts_badge = '<span style="color:#f39c12;font-size:10px">⏳训练中</span>'
+        elif seg.get("speaker_label") and ts_label == "untrained":
+            ts_badge = '<span style="color:#e67e22;font-size:10px">⚠️未训练</span>'
+        if is_ignored:
+            ts_badge = '<span style="color:#95a5a6;font-size:10px">已忽略</span>'
+
         rows += (
             "<tr>"
             f'<td>{rec.get("id","")}</td>'
@@ -828,22 +1051,27 @@ async def label_speakers_page(
             f'<td>{seg.get("segment_index","")}</td>'
             f'<td>{seg.get("duration_sec",0):.1f}s</td>'
             f'<td><span class="badge" style="background:{color};color:#fff">{seg.get("speaker_type","")}</span></td>'
-            f'<td><span id="lbl-{seg["id"]}">{lbl}</span></td>'
-            f'<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio({seg["id"]})">▶</button></td>'
-            '<td><select id="sel-{sid}" class="label-select" onchange="setLabel({sid})">'
-            '<option value="">选择</option>'
-            '<option value="agent"{sa}>坐席</option>'
-            '<option value="customer"{sc}>客户</option>'
-            '<option value="noise"{sn}>噪声</option>'
-            "</select></td>"
+            f'<td><span id="lbl-{sid}">{lbl}</span>{ts_badge}</td>'
+            f'<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio({sid})">▶</button></td>'
             '<td>'
-            '<input type="text" id="custom-{sid}" placeholder="自定义" style="width:80px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px">'
-            '<button class="btn-sm" style="background:#8e44ad" onclick="setCustomLabel({sid})">✓</button>'
-            "</td></tr>"
+            f'<select id="sel-{sid}" class="label-select" onchange="onLabelSelect({sid})">'
+            f'{speaker_opts}'
+            '<option value="__custom__">✏️ 自定义...</option>'
+            '</select>'
+            f'<input type="text" id="custom-{sid}" placeholder="新说话人ID" style="width:80px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px;display:none">'
+            f'<button class="btn-sm" style="background:#8e44ad" onclick="setLabel({sid})">✓</button>'
+            "</td>"
+            # Auto-label preview column
+            f'<td id="auto-{sid}">—</td>'
+            "</tr>"
         )
 
     if not all_segments:
-        rows = "<tr><td colspan='9' style='text-align:center;color:#999;padding:30px'>暂无待打标片段</td></tr>"
+        rows = "<tr><td colspan='10' style='text-align:center;color:#999;padding:30px'>暂无待打标片段</td></tr>"
+
+    # Serialize checkpoint info for JS
+    import json
+    cp_json = json.dumps(cp_info, ensure_ascii=False)
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -855,7 +1083,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
 .nav {{ background:#2c3e50;color:#fff;padding:12px 24px;display:flex;align-items:center;gap:20px;font-size:14px }}
 .nav a {{ color:#bdc3c7;text-decoration:none }}
 .nav .user{{margin-left:auto;font-size:13px}}
-.container{{max-width:1100px;margin:24px auto;padding:0 16px}}
+.container{{max-width:1200px;margin:24px auto;padding:0 16px}}
 .card{{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
 .card h2{{font-size:18px;margin-bottom:16px}}
 .summary-bar{{display:flex;gap:16px;margin-bottom:16px}}
@@ -869,9 +1097,17 @@ td{{padding:6px 8px;font-size:13px;border-bottom:1px solid #eee}}
 .btn{{padding:7px 16px;border:none;border-radius:5px;cursor:pointer;font-size:13px}}
 .btn-primary{{background:#3498db;color:#fff}}
 .btn-sm{{padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;color:#fff}}
-.label-select{{padding:3px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px}}
+.label-select{{padding:3px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px;max-width:100px}}
 #audioPlayer{{display:none;margin-bottom:12px}}
 audio{{width:100%}}
+.filter-bar{{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}}
+.filter-bar label{{font-size:12px;color:#555}}
+.filter-bar select,.filter-bar input{{padding:4px 8px;border:1px solid #ddd;border-radius:4px;font-size:12px}}
+.auto-preview{{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:12px;margin-bottom:12px;display:none}}
+.auto-preview h3{{font-size:14px;margin-bottom:8px}}
+.preview-result{{font-size:12px;color:#555;margin-bottom:4px}}
+.preview-accept{{margin:4px 0}}
+.preview-accept label{{font-size:12px;margin-left:4px}}
 </style></head>
 <body>
 <div class="nav">
@@ -888,52 +1124,231 @@ audio{{width:100%}}
         <div class="summary-item"><div class="summary-num" style="color:#e67e22">{unlabeled_count}</div><div class="summary-label">待打标</div></div>
         <div class="summary-item"><div class="summary-num" style="color:#27ae60">{len(all_segments)-unlabeled_count}</div><div class="summary-label">已打标</div></div>
     </div>
+
+    <!-- 系统自动打标面板 -->
     <div class="card">
-        <h2>说话人打标</h2>
-        <div style="margin-bottom:12px;display:flex;gap:8px">
-            <button class="btn btn-primary" onclick="autoLabel()">📌 系统自动打标</button>
+        <h2>系统自动打标</h2>
+        <div class="filter-bar">
+            <label>模型：</label>
+            <select id="autoModel" onchange="onModelChange()">
+                {model_opts}
+            </select>
+            <label>版本：</label>
+            <select id="autoCheckpoint">{cp_opts}</select>
+            <button class="btn btn-primary" onclick="previewAutoLabel()">🔍 预览自动打标</button>
+            <button class="btn" style="background:#27ae60;color:#fff" onclick="confirmAutoLabel()" id="btnConfirmAuto" disabled>💾 全部确认保存</button>
+        </div>
+        <div id="autoPreview" class="auto-preview">
+            <h3>自动打标预览</h3>
+            <div id="autoPreviewText">执行预览后显示各片段识别结果...</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>手动打标</h2>
+        <div class="filter-bar">
+            <label>类型：</label>
+            <select onchange="location.href='/model-manager/label?speaker_type='+this.value+'&label_status={label_status}&model_name={model_name}&checkpoint_id={checkpoint_id}'">
+                <option value="">全部</option>
+                <option value="agent" {'selected' if speaker_type=='agent' else ''}>坐席</option>
+                <option value="customer" {'selected' if speaker_type=='customer' else ''}>客户</option>
+                <option value="unknown" {'selected' if speaker_type=='unknown' else ''}>未知</option>
+            </select>
+            <label>状态：</label>
+            <select onchange="location.href='/model-manager/label?label_status='+this.value+'&speaker_type={speaker_type}&model_name={model_name}&checkpoint_id={checkpoint_id}'">
+                <option value="">全部（已断句）</option>
+                <option value="all" {'selected' if label_status=='all' else ''}>全部</option>
+            </select>
+            <span style="font-size:11px;color:#999">选择片段 → 选说话人 → 点 ✓ 确认</span>
         </div>
         <div id="audioPlayer"><audio id="player" controls></audio></div>
         <table>
-            <thead><tr><th>录音ID</th><th>坐席</th><th>片段</th><th>时长</th><th>类型</th><th>标签</th><th>播放</th><th>快速标记</th><th>自定义</th></tr></thead>
+            <thead><tr><th>录音ID</th><th>坐席</th><th>片段</th><th>时长</th><th>类型</th><th>标签</th><th>播放</th><th>手动标记</th><th>自动结果</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>
     </div>
 </div>
 <script>
+var checkpoints = {cp_json};
+var autoResults = {{}};  // segId -> {{speaker_label, score, reason}}
+
 function playAudio(segId) {{
     document.getElementById("audioPlayer").style.display = "block";
     document.getElementById("player").src = "/model-manager/segments/audio/" + segId;
     document.getElementById("player").play();
 }}
+
+function onModelChange() {{
+    const mn = document.getElementById("autoModel").value;
+    const cp = document.getElementById("autoCheckpoint");
+    cp.innerHTML = '<option value="">-- 选择版本 --</option>';
+    checkpoints.forEach(function(c) {{
+        if (!mn || c.model_name === mn) {{
+            var opt = document.createElement("option");
+            opt.value = c.id;
+            opt.textContent = c.id + " - " + c.model_name + " (" + c.version_tag + ")";
+            cp.appendChild(opt);
+        }}
+    }});
+}}
+
+function onLabelSelect(segId) {{
+    const sel = document.getElementById("sel-" + segId);
+    const custom = document.getElementById("custom-" + segId);
+    custom.style.display = (sel.value === "__custom__") ? "inline-block" : "none";
+}}
+
 async function setLabel(segId) {{
     const sel = document.getElementById("sel-" + segId);
-    const label = sel.value;
-    if (!label) return;
-    const resp = await fetch("/model-manager/segments/" + segId + "/label", {{
-        method: "POST", headers:{{"Content-Type":"application/json"}},
-        body: JSON.stringify({{speaker_label: label, label_source: "manual"}})
-    }});
-    const r = await resp.json();
-    if (r.success) document.getElementById("lbl-" + segId).textContent = label;
+    const custom = document.getElementById("custom-" + segId);
+    var label = "";
+    var speakerType = "";
+
+    if (sel.value === "__custom__") {{
+        label = custom.value.trim();
+        if (!label) {{ alert("请输入新说话人ID"); return; }}
+    }} else if (sel.value === "__noise__") {{
+        label = "__noise__";
+        speakerType = "ignored";
+    }} else if (sel.value) {{
+        label = sel.value;
+    }} else {{
+        return;
+    }}
+
+    try {{
+        const resp = await fetch("/model-manager/segments/" + segId + "/label", {{
+            method: "POST", headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify({{
+                speaker_label: label,
+                label_source: "manual",
+                speaker_type: speakerType,
+                update_trained_status: true
+            }})
+        }});
+        const r = await resp.json();
+        if (r.success) {{
+            var displayLabel = (label === "__noise__") ? "🔇 噪音" : label;
+            document.getElementById("lbl-" + segId).textContent = displayLabel;
+            sel.value = "";
+            custom.style.display = "none";
+            custom.value = "";
+        }} else {{
+            alert("设置失败: " + (r.error || ""));
+        }}
+    }} catch(e) {{ alert("网络错误: " + e.message); }}
 }}
-async function setCustomLabel(segId) {{
-    const input = document.getElementById("custom-" + segId);
-    const label = input.value.trim();
-    if (!label) return;
-    const resp = await fetch("/model-manager/segments/" + segId + "/label", {{
-        method: "POST", headers:{{"Content-Type":"application/json"}},
-        body: JSON.stringify({{speaker_label: label, label_source: "manual"}})
-    }});
-    const r = await resp.json();
-    if (r.success) {{ document.getElementById("lbl-" + segId).textContent = label; input.value = ""; }}
+
+function getCheckpointInfo(cpId) {{
+    for (var i = 0; i < checkpoints.length; i++) {{
+        if (String(checkpoints[i].id) === String(cpId)) return checkpoints[i];
+    }}
+    return null;
 }}
-async function autoLabel() {{
-    if (!confirm("确定执行系统自动说话人打标？")) return;
-    const resp = await fetch("/model-manager/run-label", {{ method:"POST" }});
-    const r = await resp.json();
-    alert(r.success ? "自动打标完成" : "失败: " + (r.error||JSON.stringify(r)));
-    location.reload();
+
+async function previewAutoLabel() {{
+    const cpId = document.getElementById("autoCheckpoint").value;
+    if (!cpId) {{ alert("请选择模型版本"); return; }}
+
+    const btn = event.target; btn.disabled = true;
+    var origText = btn.textContent; btn.textContent = "分析中...";
+
+    try {{
+        const resp = await fetch("/model-manager/run-label", {{
+            method: "POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify({{checkpoint_id: parseInt(cpId), preview_only: true, model_name: document.getElementById("autoModel").value}})
+        }});
+        const r = await resp.json();
+
+        if (r.error) {{
+            document.getElementById("autoPreview").style.display = "block";
+            document.getElementById("autoPreviewText").innerHTML = '<span style="color:#e74c3c">错误: ' + r.error + '</span>';
+            btn.disabled = false; btn.textContent = origText;
+            return;
+        }}
+
+        // r.results is {{segId: {{speaker_label, score, reason}}}}
+        autoResults = r.results || {{}};
+        var previewHtml = "";
+        var matchCount = 0;
+        var segIds = Object.keys(autoResults);
+        for (var si = 0; si < segIds.length; si++) {{
+            var segId = segIds[si];
+            var res = autoResults[segId];
+            if (!res) continue;
+            matchCount++;
+
+            // Show in the preview panel
+            previewHtml += '<div class="preview-result">';
+            previewHtml += '  片段 #' + segId + ': <strong>' + (res.speaker_label || "?") + '</strong>';
+            previewHtml += '  置信度: ' + (res.score ? res.score.toFixed(3) : "—");
+            previewHtml += '  理由: ' + (res.reason || "—");
+            previewHtml += '</div>';
+
+            // Also update the table cell
+            var autoCell = document.getElementById("auto-" + segId);
+            if (autoCell) {{
+                var acceptCheck = '<input type="checkbox" class="auto-accept" data-seg="' + segId + '" checked onchange="updateConfirmBtn()"> '
+                    + '<strong>' + (res.speaker_label || "?") + '</strong>'
+                    + ' <span style="color:#888;font-size:10px">' + (res.score ? res.score.toFixed(3) : "") + '</span>';
+                autoCell.innerHTML = acceptCheck;
+            }}
+        }}
+
+        if (matchCount === 0) {{
+            previewHtml = '<span style="color:#888">所有片段已有标签或已被忽略，无需自动打标。</span>';
+        }}
+
+        document.getElementById("autoPreview").style.display = "block";
+        document.getElementById("autoPreviewText").innerHTML = previewHtml;
+        updateConfirmBtn();
+    }} catch(e) {{
+        document.getElementById("autoPreview").style.display = "block";
+        document.getElementById("autoPreviewText").innerHTML = '<span style="color:#e74c3c">请求失败: ' + e.message + '</span>';
+    }}
+    btn.disabled = false; btn.textContent = origText;
+}}
+
+function updateConfirmBtn() {{
+    var checkboxes = document.querySelectorAll(".auto-accept:checked");
+    document.getElementById("btnConfirmAuto").disabled = (checkboxes.length === 0);
+}}
+
+async function confirmAutoLabel() {{
+    if (!confirm("确定用自动打标结果更新所有勾选的片段？")) return;
+    var checkboxes = document.querySelectorAll(".auto-accept:checked");
+    var toSave = [];
+    checkboxes.forEach(function(cb) {{
+        var segId = cb.getAttribute("data-seg");
+        var res = autoResults[segId];
+        if (res) toSave.push(segId);
+    }});
+
+    if (toSave.length === 0) {{ alert("没有勾选的片段"); return; }}
+
+    var btn = document.getElementById("btnConfirmAuto");
+    var origText = btn.textContent; btn.disabled = true; btn.textContent = "保存中...";
+
+    try {{
+        const resp = await fetch("/model-manager/run-label", {{
+            method: "POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify({{
+                checkpoint_id: parseInt(document.getElementById("autoCheckpoint").value),
+                confirm_segments: toSave,
+                model_name: document.getElementById("autoModel").value
+            }})
+        }});
+        const r = await resp.json();
+        if (r.success) {{
+            alert("已保存 " + (r.saved_count || toSave.length) + " 个片段标签");
+            location.reload();
+        }} else {{
+            alert("保存失败: " + (r.error || ""));
+        }}
+    }} catch(e) {{ alert("网络错误: " + e.message); }}
+    btn.disabled = false; btn.textContent = origText;
 }}
 </script>
 </body>
