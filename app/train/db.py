@@ -116,7 +116,7 @@ def claim_pending_recordings(conn: sqlite3.Connection, limit: int = 1) -> List[D
     Atomically sets pre_status='processing', returns up to `limit` rows.
     """
     rows = conn.execute(
-        """SELECT id, biz_system, call_id, agent_id, customer_phone,
+        """SELECT id, biz_system, call_id, agent_id, customer_id,
                   call_timestamp, local_audio_path, status, pre_status
            FROM recordings
            WHERE (pre_status IS NULL OR pre_status = 'pending'
@@ -206,7 +206,7 @@ def get_ready_for_training(
     """Get recordings that are ready for training (preprocessed but not yet trained)."""
     if limit > 0:
         rows = conn.execute(
-            """SELECT id, biz_system, call_id, agent_id, customer_phone,
+            """SELECT id, biz_system, call_id, agent_id, customer_id,
                       call_timestamp, local_audio_path, status, pre_status,
                       train_status
                FROM recordings
@@ -216,7 +216,7 @@ def get_ready_for_training(
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, biz_system, call_id, agent_id, customer_phone,
+            """SELECT id, biz_system, call_id, agent_id, customer_id,
                       call_timestamp, local_audio_path, status, pre_status,
                       train_status
                FROM recordings

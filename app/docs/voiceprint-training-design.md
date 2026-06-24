@@ -146,7 +146,7 @@ POST /api/v1/recordings/push
 |------|------|------|------|
 | `biz_system` | string | 是 | 业务系统标识：`collection`（催收）或 `cs`（客服） |
 | `agent_id` | string | 是 | 坐席工号 ID |
-| `customer_phone` | string | 是 | 客户脱敏号码 |
+| `customer_id` | string | 是 | 客户脱敏号码 |
 | `call_timestamp` | string | 是 | 通话时间，ISO 8601 格式 |
 | `call_id` | string | 是 | 通话唯一 ID（业务系统保证唯一） |
 | `audio_source` | string | 是 | 录音来源类型：`binary` / `url` / `id` |
@@ -229,7 +229,7 @@ CREATE TABLE recordings (
     biz_system      TEXT    NOT NULL,          -- 'collection' | 'cs'
     call_id         TEXT    NOT NULL UNIQUE,   -- 业务系统通话 ID
     agent_id        TEXT    NOT NULL,          -- 坐席工号
-    customer_phone  TEXT    NOT NULL,          -- 客户脱敏号码
+    customer_id  TEXT    NOT NULL,          -- 客户脱敏号码
     call_timestamp  TEXT    NOT NULL,          -- ISO 8601
     channel_separated INTEGER DEFAULT 0,       -- 0/1
     duration_sec    REAL,

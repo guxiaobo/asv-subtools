@@ -747,7 +747,7 @@ def build_training_data() -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
 
     流程:
       1. 从 preprocessed/collection/ 按 call_id 收集音频段
-      2. 从 recordings 表查询 customer_phone 作为 speaker 名
+      2. 从 recordings 表查询 customer_id 作为 speaker 名
       3. Agent 段跳过（模型仅增量客户声纹）
       4. 返回 (wav_path, speaker_id) 列表 + id_to_name 映射
 
@@ -758,10 +758,10 @@ def build_training_data() -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
 
     db_path = str(PROJECT_ROOT / "data" / "training.db")
     conn = sqlite3.connect(db_path)
-    cursor = conn.execute('SELECT call_id, customer_phone FROM recordings WHERE status=?', ('preprocessed',))
+    cursor = conn.execute('SELECT call_id, customer_id FROM recordings WHERE status=?', ('preprocessed',))
     call_to_customer = {r[0]: r[1] for r in cursor.fetchall()}
     cursor = conn.execute(
-        "SELECT s.file_path, r.call_id, r.customer_phone "
+        "SELECT s.file_path, r.call_id, r.customer_id "
         "FROM audio_segments s "
         "JOIN recordings r ON r.id = s.recording_id "
         "WHERE s.is_ignored = 0 "
@@ -771,7 +771,7 @@ def build_training_data() -> Tuple[List[Tuple[str, int]], Dict[int, str]]:
     for row in cursor.fetchall():
         segments_by_call[row[1]].append({
             'file_path': row[0],
-            'customer_phone': row[2],
+            'customer_id': row[2],
         })
     conn.close()
 

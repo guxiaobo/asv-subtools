@@ -74,7 +74,7 @@ def _parse_filename(filename: str) -> dict:
             "valid": bool,
             "error": str | None,
             "agent_id_from_filename": str,     # 空串表示未从文件名提取
-            "customer_phone": str,
+            "customer_id": str,
             "call_timestamp": str,             # ISO 8601 或空串
             "call_id": str,                     # 文件名不含扩展名
             "num_parts": int,                   # 2 或 3
@@ -84,7 +84,7 @@ def _parse_filename(filename: str) -> dict:
         "valid": False,
         "error": None,
         "agent_id_from_filename": "",
-        "customer_phone": "",
+        "customer_id": "",
         "call_timestamp": "",
         "call_id": "",
         "num_parts": 0,
@@ -149,14 +149,14 @@ def _parse_filename(filename: str) -> dict:
     # 按格式解析各字段
     if num_parts == 2:
         # {customer}-{YYMMDDHHMM}
-        result["customer_phone"] = parts[0]
+        result["customer_id"] = parts[0]
         if not parts[0]:
             result["error"] = "客户标识为空（'-' 前无内容）"
             return result
     else:
         # {agent_id}-{customer}-{YYMMDDHHMM}
         result["agent_id_from_filename"] = parts[0]
-        result["customer_phone"] = parts[1]
+        result["customer_id"] = parts[1]
         if not parts[0]:
             result["error"] = "坐席 ID 为空（第一个 '-' 前无内容）"
             return result
@@ -248,7 +248,7 @@ async def upload_recording(
         )
 
     # ── 5. 从解析结果提取元数据 ────────────────────────────────────
-    customer_phone = parsed["customer_phone"]
+    customer_id = parsed["customer_id"]
     call_timestamp = parsed["call_timestamp"]
     call_id = parsed["call_id"]
 
@@ -274,7 +274,7 @@ async def upload_recording(
             "data": {
                 "recording_id": existing["id"],
                 "call_id": existing["call_id"],
-                "customer_phone": existing["customer_phone"],
+                "customer_id": existing["customer_id"],
                 "call_timestamp": existing["call_timestamp"],
                 "local_path": existing["local_audio_path"] or "",
                 "status": existing["status"],
@@ -303,7 +303,7 @@ async def upload_recording(
         biz_system=biz_system,
         call_id=call_id,
         agent_id=resolved_agent_id,
-        customer_phone=customer_phone,
+        customer_id=customer_id,
         call_timestamp=call_timestamp,
         audio_source_type="binary",
         local_audio_path=local_path,
@@ -315,7 +315,7 @@ async def upload_recording(
     elapsed_ms = round((time.time() - start) * 1000, 1)
     logger.info(
         "网页上传完成: id=%d call_id=%s agent=%s customer=%s ts=%s (%dms)",
-        rec_id, call_id, resolved_agent_id, customer_phone, call_timestamp, elapsed_ms,
+        rec_id, call_id, resolved_agent_id, customer_id, call_timestamp, elapsed_ms,
     )
 
     return JSONResponse(content={
@@ -325,7 +325,7 @@ async def upload_recording(
             "recording_id": rec_id,
             "call_id": call_id,
             "agent_id": resolved_agent_id,
-            "customer_phone": customer_phone,
+            "customer_id": customer_id,
             "call_timestamp": call_timestamp,
             "local_path": local_path,
             "status": "raw",
@@ -356,7 +356,7 @@ async def upload_history(
         async with aiosqlite.connect(str(path)) as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
-                "SELECT id, call_id, agent_id, customer_phone, "
+                "SELECT id, call_id, agent_id, customer_id, "
                 "call_timestamp, status, created_at "
                 "FROM recordings "
                 "ORDER BY id DESC LIMIT ?",

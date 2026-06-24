@@ -4,7 +4,7 @@
 # 推送到 ASV 训练系统
 #
 # API 会自动从文件名推导以下字段：
-#   - customer_phone: 第一个 '-' 前的字符串
+#   - customer_id: 第一个 '-' 前的字符串
 #   - call_timestamp: 时间戳 (YYMMDDHHMM → ISO 8601)
 #   - call_id: 完整文件名（不含扩展名）
 #
@@ -94,7 +94,7 @@ for f in "${all_files[@]}"; do
     # Progress
     echo -n "  [$count/$total_files] $filename ... "
 
-    # Push via curl — API 自动从文件名提取 customer_phone / call_timestamp / call_id
+    # Push via curl — API 自动从文件名提取 customer_id / call_timestamp / call_id
     http_code=$(curl -s -o /tmp/push_resp_$$.json -w "%{http_code}" \
         -X POST "$API_URL" \
         -F "biz_system=$BIZ_SYSTEM" \
@@ -108,7 +108,7 @@ for f in "${all_files[@]}"; do
 import json, sys
 d=json.load(open('/tmp/push_resp_$$.json'))
 data=d.get('data',{})
-print(f\"{data.get('recording_id','?')} cust={data.get('customer_phone','?')} ts={data.get('call_timestamp','?')}\")" 2>/dev/null)
+print(f\"{data.get('recording_id','?')} cust={data.get('customer_id','?')} ts={data.get('call_timestamp','?')}\")" 2>/dev/null)
         echo "✅ id=$rec_id"
         success=$((success + 1))
     else

@@ -547,9 +547,9 @@ async def run_label_speakers(request: Request):
                     }
                 elif sp_type == "customer":
                     results[str(sid)] = {
-                        "speaker_label": "@customer_" + str(rec.get("customer_phone", "?")),
+                        "speaker_label": "@customer_" + str(rec.get("customer_id", "?")),
                         "score": 0.72,
-                        "reason": f"跨录音聚类客户电话特征匹配, 置信度: 0.72",
+                        "reason": f"跨录音聚类客户ID特征匹配, 置信度: 0.72",
                     }
                 else:
                     results[str(sid)] = {

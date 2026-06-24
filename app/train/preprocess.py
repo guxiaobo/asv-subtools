@@ -263,18 +263,18 @@ def _cross_call_aggregate_phase(
 
     # 查询所有已完成的录音
     recs = conn.execute(
-        "SELECT id, customer_phone, call_id, biz_system, call_timestamp, pre_result "
+        "SELECT id, customer_id, call_id, biz_system, call_timestamp, pre_result "
         "FROM recordings WHERE pre_status='done' ORDER BY call_id"
     ).fetchall()
     if not recs:
         logger.info("跨录音聚合: 无已完成录音，跳过")
         return
 
-    # 按客户 ID 分组（优先使用 customer_phone 字段，回退到 call_id 提取）
+    # 按客户 ID 分组（优先使用 customer_id 字段，回退到 call_id 提取）
     from collections import defaultdict
     by_customer = defaultdict(list)
     for r in recs:
-        cust_id = r["customer_phone"] or _extract_customer_id(r["call_id"])
+        cust_id = r["customer_id"] or _extract_customer_id(r["call_id"])
         by_customer[cust_id].append(dict(r))
 
     logger.info("跨录音聚合: %d 位客户 / %d 通录音", len(by_customer), len(recs))

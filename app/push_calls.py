@@ -4,7 +4,7 @@
 推送到 ASV 训练系统。
 
 API 会自动从文件名推导以下字段：
-  - customer_phone: 第一个 '-' 前的字符串
+  - customer_id: 第一个 '-' 前的字符串
   - call_timestamp: 时间戳 (YYMMDDHHMM → ISO 8601)
   - call_id: 完整文件名（不含扩展名）
 
@@ -170,8 +170,8 @@ def format_result(data: dict) -> str:
     parts = []
     if "recording_id" in d:
         parts.append(f"id={d['recording_id']}")
-    if "customer_phone" in d:
-        parts.append(f"cust={d['customer_phone']}")
+    if "customer_id" in d:
+        parts.append(f"cust={d['customer_id']}")
     if "call_timestamp" in d:
         parts.append(f"ts={d['call_timestamp']}")
     return " ".join(parts)

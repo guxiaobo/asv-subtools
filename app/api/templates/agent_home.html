@@ -106,7 +106,7 @@
                 {% for r in recordings %}
                 <tr>
                     <td>{{ r.id }}</td>
-                    <td>{{ r.customer_phone }}</td>
+                    <td>{{ r.customer_id }}</td>
                     <td>{{ r.call_timestamp[:16] if r.call_timestamp else '-' }}</td>
                     <td>{{ '%.1f'|format(r.duration_sec) if r.duration_sec else '-' }}</td>
                     <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>

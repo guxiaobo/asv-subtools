@@ -162,7 +162,7 @@ async def push_recording(
     # Metadata (form fields)
     biz_system: str = Form(..., description="业务系统: collection | cs"),
     agent_id: str = Form(..., min_length=1, max_length=64, description="坐席工号"),
-    customer_phone: Optional[str] = Form(default=None, description="客户脱敏号码（可选，未提供则从文件名自动提取）"),
+    customer_id: Optional[str] = Form(default=None, description="客户脱敏号码（可选，未提供则从文件名自动提取）"),
     call_timestamp: Optional[str] = Form(default=None, description="通话时间 (ISO 8601)（可选，未提供则从文件名自动提取 YYMMDDHHMM）"),
     call_id: Optional[str] = Form(default=None, description="通话唯一 ID（可选，未提供则使用文件名不含扩展名）"),
     audio_source_type: str = Form(..., description="音频来源: binary | url | id"),
@@ -188,7 +188,7 @@ async def push_recording(
     3. **id**:     提供业务系统内部录音 ID，由 fetcher 插件拉取
 
     客户 ID 规则（binary 模式）：
-      优先使用传入的 customer_phone，若未提供则自动从音频文件名提取
+      优先使用传入的 customer_id，若未提供则自动从音频文件名提取
       （第一个 "-" 之前的字符串作为客户 ID）。
 
     流程：
@@ -197,7 +197,7 @@ async def push_recording(
     start = time.time()
 
     # ── 客户 ID / 时间戳 / call_id 自动提取（binary 模式） ──
-    resolved_customer_phone = customer_phone or ""
+    resolved_customer_id = customer_id or ""
     resolved_call_timestamp = call_timestamp
     resolved_call_id = call_id
 
@@ -209,11 +209,11 @@ async def push_recording(
             )
         filename = audio_data.filename or ""
         # 客户 ID：传参优先，否则从文件名提取
-        if not resolved_customer_phone and filename:
-            resolved_customer_phone = _extract_customer_id_from_filename(filename)
+        if not resolved_customer_id and filename:
+            resolved_customer_id = _extract_customer_id_from_filename(filename)
             logger.info(
                 "客户 ID 从文件名自动提取: '%s' → '%s'",
-                filename, resolved_customer_phone,
+                filename, resolved_customer_id,
             )
         # 时间戳：传参优先，否则从文件名提取 YYMMDDHHMM
         if not resolved_call_timestamp and filename:
@@ -300,7 +300,7 @@ async def push_recording(
                 "data": {
                     "recording_id": existing["id"],
                     "call_id": existing["call_id"],
-                    "customer_phone": existing["customer_phone"],
+                    "customer_id": existing["customer_id"],
                     "call_timestamp": existing["call_timestamp"],
                     "local_path": existing["local_audio_path"] or "",
                     "status": existing["status"],
@@ -345,7 +345,7 @@ async def push_recording(
                 "data": {
                     "recording_id": existing["id"],
                     "call_id": existing["call_id"],
-                    "customer_phone": existing["customer_phone"],
+                    "customer_id": existing["customer_id"],
                     "call_timestamp": existing["call_timestamp"],
                     "local_path": existing["local_audio_path"] or "",
                     "status": existing["status"],
@@ -388,7 +388,7 @@ async def push_recording(
                 "data": {
                     "recording_id": existing["id"],
                     "call_id": existing["call_id"],
-                    "customer_phone": existing["customer_phone"],
+                    "customer_id": existing["customer_id"],
                     "call_timestamp": existing["call_timestamp"],
                     "local_path": existing["local_audio_path"] or "",
                     "status": existing["status"],
@@ -408,7 +408,7 @@ async def push_recording(
         biz_system=biz_system,
         call_id=resolved_call_id,
         agent_id=agent_id,
-        customer_phone=resolved_customer_phone,
+        customer_id=resolved_customer_id,
         call_timestamp=resolved_call_timestamp,
         audio_source_type=audio_source_type,
         local_audio_path=local_path,
@@ -422,7 +422,7 @@ async def push_recording(
     elapsed_ms = (time.time() - start) * 1000
     logger.info(
         "Recording pushed: id=%d call_id=%s customer=%s ts=%s %s/%s (%dms)",
-        rec_id, resolved_call_id, resolved_customer_phone,
+        rec_id, resolved_call_id, resolved_customer_id,
         resolved_call_timestamp, biz_system, agent_id, elapsed_ms,
     )
 
@@ -431,7 +431,7 @@ async def push_recording(
         "data": {
             "recording_id": rec_id,
             "call_id": resolved_call_id,
-            "customer_phone": resolved_customer_phone,
+            "customer_id": resolved_customer_id,
             "call_timestamp": resolved_call_timestamp,
             "local_path": local_path or "",
             "status": "raw",

@@ -55,7 +55,7 @@ class RecordingIn(BaseModel):
     """API 推送录音时的请求数据。"""
     biz_system: BizSystem
     agent_id: str = Field(..., min_length=1, max_length=64)
-    customer_phone: str = Field(..., min_length=1, max_length=32)
+    customer_id: str = Field(..., min_length=1, max_length=32)
     call_timestamp: str  # ISO 8601
     call_id: str = Field(..., min_length=1, max_length=128)
     audio_source_type: AudioSourceType
@@ -80,7 +80,7 @@ class RecordingRow(BaseModel):
     biz_system: str
     call_id: str
     agent_id: str
-    customer_phone: str
+    customer_id: str
     call_timestamp: str
     channel_separated: int
     duration_sec: Optional[float]

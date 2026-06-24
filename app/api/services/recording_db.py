@@ -106,7 +106,7 @@ async def get_recording_by_hash(
     conn = await _open_conn(db_path)
     try:
         cursor = await conn.execute(
-            "SELECT id, call_id, customer_phone, call_timestamp, local_audio_path, status "
+            "SELECT id, call_id, customer_id, call_timestamp, local_audio_path, status "
             "FROM recordings WHERE file_hash = ? LIMIT 1",
             (file_hash,),
         )
@@ -121,7 +121,7 @@ async def insert_recording(
     biz_system: str,
     call_id: str,
     agent_id: str,
-    customer_phone: str,
+    customer_id: str,
     call_timestamp: str,
     audio_source_type: str,
     local_audio_path: Optional[str] = None,
@@ -151,14 +151,14 @@ async def insert_recording(
         await conn.execute(
             """
             INSERT INTO recordings
-                (biz_system, call_id, agent_id, customer_phone, call_timestamp,
+                (biz_system, call_id, agent_id, customer_id, call_timestamp,
                  audio_source_type, local_audio_path, audio_original_url, file_hash,
                  channel_separated, duration_sec, status, pre_status, train_status,
                  created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'raw', 'pending', 'pending', ?, ?)
             ON CONFLICT(call_id) DO UPDATE SET
                 agent_id = excluded.agent_id,
-                customer_phone = excluded.customer_phone,
+                customer_id = excluded.customer_id,
                 call_timestamp = excluded.call_timestamp,
                 audio_source_type = excluded.audio_source_type,
                 local_audio_path = excluded.local_audio_path,
@@ -172,7 +172,7 @@ async def insert_recording(
                 biz_system,
                 call_id,
                 agent_id,
-                customer_phone,
+                customer_id,
                 call_timestamp,
                 audio_source_type,
                 local_audio_path,
@@ -676,7 +676,7 @@ async def get_batches_with_counts(
 
 async def list_recordings_with_segments(
     agent_id: str = "",
-    customer_phone: str = "",
+    customer_id: str = "",
     date_from: str = "",
     date_to: str = "",
     status_filter: str = "",
@@ -691,9 +691,9 @@ async def list_recordings_with_segments(
     if agent_id:
         conditions.append("r.agent_id = ?")
         params.append(agent_id)
-    if customer_phone:
-        conditions.append("r.customer_phone = ?")
-        params.append(customer_phone)
+    if customer_id:
+        conditions.append("r.customer_id = ?")
+        params.append(customer_id)
     if date_from:
         conditions.append("r.call_timestamp >= ?")
         params.append(date_from)
@@ -740,7 +740,7 @@ async def list_recordings_with_segments(
 
 async def list_recordings_with_segments_paginated(
     agent_id: str = "",
-    customer_phone: str = "",
+    customer_id: str = "",
     date_from: str = "",
     date_to: str = "",
     status_filter: str = "",
@@ -755,9 +755,9 @@ async def list_recordings_with_segments_paginated(
     if agent_id:
         conditions.append("r.agent_id = ?")
         params.append(agent_id)
-    if customer_phone:
-        conditions.append("r.customer_phone = ?")
-        params.append(customer_phone)
+    if customer_id:
+        conditions.append("r.customer_id = ?")
+        params.append(customer_id)
     if date_from:
         conditions.append("r.call_timestamp >= ?")
         params.append(date_from)
@@ -1304,10 +1304,9 @@ async def get_segment_stats(db_path: Optional[str] = None) -> Dict[str, int]:
     try:
         stats: Dict[str, int] = {}
 
-        # 总录音数（已预处理完成：done + unsegmentable）
+        # 总录音数
         cur = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recordings "
-            "WHERE pre_status IN ('done', 'unsegmentable')"
+            "SELECT COUNT(*) AS cnt FROM recordings"
         )
         stats["total_recordings"] = (await cur.fetchone())["cnt"]
 

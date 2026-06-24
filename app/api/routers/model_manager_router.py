@@ -278,7 +278,7 @@ async def get_vad_config(request: Request):
 async def segment_manager_page(
     request: Request,
     agent_id: str = "",
-    customer_phone: str = "",
+    customer_id: str = "",
     date_from: str = "",
     date_to: str = "",
     status: str = "",
@@ -297,12 +297,12 @@ async def segment_manager_page(
     total_count = 0
     try:
         # 仅当设置了筛选条件时加载录音列表
-        has_filter = bool(agent_id or customer_phone or date_from or date_to or status)
+        has_filter = bool(agent_id or customer_id or date_from or date_to or status)
         if has_filter:
             offset_val = (page - 1) * per_page
             recordings, total_count = await db.list_recordings_with_segments_paginated(
                 agent_id=agent_id,
-                customer_phone=customer_phone,
+                customer_id=customer_id,
                 date_from=date_from,
                 date_to=date_to,
                 status_filter=status,
@@ -325,8 +325,8 @@ async def segment_manager_page(
     total_pages = max(1, (total_count + per_page - 1) // per_page) if total_count else 1
 
     page = _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
-                                agent_id, customer_phone, date_from, date_to, status,
-                                page, total_pages, total_count, bool(agent_id or customer_phone or date_from or date_to or status))
+                                agent_id, customer_id, date_from, date_to, status,
+                                page, total_pages, total_count, bool(agent_id or customer_id or date_from or date_to or status))
     return HTMLResponse(page)
 
 
@@ -392,7 +392,7 @@ def _seg_view_link(rec: dict, batch: str, can_segment: bool, pre_status: str = "
 
 
 def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
-                         agent_id, customer_phone, date_from, date_to, status,
+                         agent_id, customer_id, date_from, date_to, status,
                          current_page, total_pages, total_count, has_filter):
     """渲染录音断句页面 HTML（含分页、筛选、多选断句）。"""
     user = user or {}
@@ -432,7 +432,7 @@ def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
             <td>{chk}</td>
             <td>{rec.get('id','')}</td>
             <td>{rec.get('agent_id','')}</td>
-            <td>{rec.get('customer_phone','')}</td>
+            <td>{rec.get('customer_id','')}</td>
             <td>{rec.get('call_timestamp','')[:16]}</td>
             <td>{rec.get('call_id','')}</td>
             <td><span style="color:{status_color};font-weight:bold">{pre_status}</span>{vad_hint}</td>
@@ -456,7 +456,7 @@ def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
     # Pagination
     pag_html = ""
     if has_filter and total_pages > 1:
-        qs = f"agent_id={agent_id}&customer_phone={customer_phone}&date_from={date_from}&date_to={date_to}&status={status}"
+        qs = f"agent_id={agent_id}&customer_id={customer_id}&date_from={date_from}&date_to={date_to}&status={status}"
         prev_dis = "disabled" if current_page <= 1 else ""
         next_dis = "disabled" if current_page >= total_pages else ""
         pag_html = f"""<div class="pagination">
@@ -550,7 +550,7 @@ input[type=checkbox]:disabled+label {{ color:#999 }}
             </div>
             <div>
                 <label style="display:block">客户</label>
-                <input type="text" name="customer_phone" value="{customer_phone}" placeholder="客户ID">
+                <input type="text" name="customer_id" value="{customer_id}" placeholder="客户ID">
             </div>
             <div>
                 <label style="display:block">日期从</label>
@@ -711,7 +711,7 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
 
     # 收集当前录音本身的坐席ID和客户ID（作为快速选项）
     rec_agent = (recording.get("agent_id") or "").strip()
-    rec_cust = (recording.get("customer_phone") or "").strip()
+    rec_cust = (recording.get("customer_id") or "").strip()
 
     # Build datalist options for searchable input
     dl_opts = ""
@@ -840,7 +840,7 @@ audio {{ width:100%; margin-top:8px }}
         <div class="info-grid">
             <div class="info-item"><div class="info-label">ID</div><div class="info-value">{recording.get('id','')}</div></div>
             <div class="info-item"><div class="info-label">坐席</div><div class="info-value">{recording.get('agent_id','')}</div></div>
-            <div class="info-item"><div class="info-label">客户</div><div class="info-value">{recording.get('customer_phone','')}</div></div>
+            <div class="info-item"><div class="info-label">客户</div><div class="info-value">{recording.get('customer_id','')}</div></div>
             <div class="info-item"><div class="info-label">文件名</div><div class="info-value">{recording.get('call_id','')}</div></div>
             <div class="info-item"><div class="info-label">时间</div><div class="info-value">{recording.get('call_timestamp','')}</div></div>
             <div class="info-item"><div class="info-label">时长</div><div class="info-value">{(recording.get('duration_sec') or 0):.1f}s</div></div>
@@ -1104,6 +1104,7 @@ async def label_speakers_page(
 
     all_segments = []
     unlabeled_count = 0
+    ignored_count = 0
     for rec in recordings:
         rec_id = rec.get("id")
         try:
@@ -1112,20 +1113,46 @@ async def label_speakers_page(
                 if speaker_type and s.get("speaker_type") != speaker_type:
                     continue
                 all_segments.append({**s, "recording_info": rec})
-                if not s.get("speaker_label") and not s.get("is_ignored"):
+                if s.get("is_ignored"):
+                    ignored_count += 1
+                elif not s.get("speaker_label"):
                     unlabeled_count += 1
         except Exception:
             pass
+    total_valid = len(all_segments) - ignored_count
+    labeled_count = total_valid - unlabeled_count
 
     # Get existing speakers + available checkpoints
     existing_speakers = []
     checkpoints = []
+    recommended_info = None
     try:
         existing_speakers = await db.list_speakers_from_segments()
         cps = await db.list_checkpoints(limit=50)
         for cp in cps:
-            if cp.get("status") in ("done", "published"):
+            st = cp.get("status", "")
+            if st in ("done", "published", "pretrained", "incremental"):
                 checkpoints.append(cp)
+
+        # 从 model_evaluations 获取最佳性能记录
+        conn = await db._open_conn()
+        try:
+            import json as _json
+            # 找 EER 最低的评估（有评估数据时用，否则 fallback 到最新 incremental）
+            best = await conn.execute(
+                "SELECT me.*, c.model_name, c.version_tag FROM model_evaluations me "
+                "JOIN checkpoints c ON me.checkpoint_id = c.id "
+                "WHERE me.eer IS NOT NULL "
+                "ORDER BY me.eer ASC LIMIT 1"
+            )
+            best_row = await best.fetchone()
+            if best_row:
+                recommended_info = dict(best_row)
+        except Exception:
+            pass
+        finally:
+            await conn.close()
+
     except Exception as e:
         logger.error("label page data: %s", e)
 
@@ -1133,36 +1160,71 @@ async def label_speakers_page(
     model_opts = '<option value="">-- 选择模型 --</option>'
     cp_opts = '<option value="">-- 选择版本 --</option>'
     seen_models = set()
+    first_model = None
     for cp in checkpoints:
         mn = cp.get("model_name", "")
         if mn and mn not in seen_models:
             seen_models.add(mn)
+            if first_model is None:
+                first_model = mn
             sel = 'selected' if model_name == mn else ''
+            if not model_name and first_model:
+                sel = 'selected' if mn == first_model else ''
             model_opts += f'<option value="{mn}" {sel}>{mn}</option>'
 
+    # 版本列表：默认只显示第一个或选中模型的版本
+    effective_model = model_name or first_model or ""
+
+    # cp_info 用作 JS 数据源：包含全部 checkpoint（供动态切换筛选）
     cp_info = []
     for cp in checkpoints:
-        if model_name and cp.get("model_name") != model_name:
-            continue
-        vt = cp.get("version_tag", "") or f"v{cp.get('id','')}"
-        sel = 'selected' if str(cp.get("id","")) == checkpoint_id else ''
-        cp_opts += f'<option value="{cp["id"]}" data-model="{cp.get("model_name","")}" {sel}>{cp["id"]} - {cp.get("model_name","")} ({vt})</option>'
         cp_info.append({
             "id": cp["id"],
             "model_name": cp.get("model_name", ""),
-            "version_tag": vt,
+            "version_tag": cp.get("version_tag", "") or f"v{cp.get('id','')}",
             "file_path": cp.get("file_path", ""),
             "embedding_dim": cp.get("embedding_dim", 192),
+            "recommended": cp.get("status") == "incremental",
         })
 
-    # Build speaker dropdown from existing speakers
-    speaker_opts = '<option value="">-- 选择 --</option>'
+    # cp_opts 仅渲染当前选中模型的版本（初始 HTML）
+    best_cp_id = None
+    for cp in checkpoints:
+        if effective_model and cp.get("model_name") != effective_model:
+            continue
+        vt = cp.get("version_tag", "") or f"v{cp.get('id','')}"
+        sel = 'selected' if str(cp.get("id","")) == checkpoint_id else ''
+        is_recommended = cp.get("status") == "incremental"
+        rec_label = " ★推荐" if is_recommended else ""
+        cp_opts += f'<option value="{cp["id"]}" data-model="{cp.get("model_name","")}" {sel}>{cp["id"]} - {cp.get("model_name","")} ({vt}){rec_label}</option>'
+        if is_recommended and best_cp_id is None:
+            best_cp_id = cp["id"]
+
+    # Build recommendation banner
+    recommendation_html = ""
+    if recommended_info:
+        eer_str = f"{recommended_info['eer']:.4f}" if recommended_info.get('eer') is not None else "—"
+        acc_str = f"{recommended_info['accuracy']:.1%}" if recommended_info.get('accuracy') is not None else "—"
+        dcf_str = f"{recommended_info['min_dcf']:.4f}" if recommended_info.get('min_dcf') is not None else "—"
+        recommendation_html = (
+            '<div style="background:#ebf5fb;border:1px solid #aed6f1;border-radius:6px;padding:10px 14px;margin-bottom:14px">'
+            '<strong>🏆 推荐模型：</strong>'
+            f'{recommended_info["model_name"]} ({recommended_info["version_tag"]})'
+            f' · EER={eer_str} · minDCF={dcf_str} · ACC={acc_str}'
+            f' <span style="color:#888;font-size:11px">（{recommended_info.get("dataset_desc","")}）</span>'
+            '</div>'
+        )
+
+    # Build datalist options for searchable manual marking
+    dl_opts = ""
+    seen_ids = set()
     for sp in existing_speakers:
-        label = sp.get("speaker_label", "") or sp.get("id", "")
-        sp_type = sp.get("speaker_type", "unknown")
-        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "未知"}.get(sp_type, sp_type)
-        speaker_opts += f'<option value="{label}">{label} ({sp_t})</option>'
-    speaker_opts += '<option value="__noise__">🔇 噪音/忽略</option>'
+        label = (sp.get("speaker_label") or "").strip()
+        if not label or label in seen_ids:
+            continue
+        seen_ids.add(label)
+        dl_opts += f'<option value="{label}">'
+    dl_opts += '<option value="__noise__">'
 
     rows = ""
     for seg in all_segments:
@@ -1194,11 +1256,8 @@ async def label_speakers_page(
             f'<td><span id="lbl-{sid}">{lbl}</span>{ts_badge}</td>'
             f'<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio({sid})">▶</button></td>'
             '<td>'
-            f'<select id="sel-{sid}" class="label-select" onchange="onLabelSelect({sid})">'
-            f'{speaker_opts}'
-            '<option value="__custom__">✏️ 自定义...</option>'
-            '</select>'
-            f'<input type="text" id="custom-{sid}" placeholder="新说话人ID" style="width:80px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px;display:none">'
+            f'<input type="text" id="sel-{sid}" class="label-search" list="dl-{sid}" placeholder="搜索或输入说话人ID" value="{sid}">'
+            f'<datalist id="dl-{sid}">{dl_opts}</datalist>'
             f'<button class="btn-sm" style="background:#8e44ad" onclick="setLabel({sid})">✓</button>'
             "</td>"
             # Auto-label preview column
@@ -1238,6 +1297,7 @@ td{{padding:6px 8px;font-size:13px;border-bottom:1px solid #eee}}
 .btn-primary{{background:#3498db;color:#fff}}
 .btn-sm{{padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;color:#fff}}
 .label-select{{padding:3px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px;max-width:100px}}
+.label-search{{width:100px;padding:3px 6px;border:1px solid #ddd;border-radius:3px;font-size:11px}}
 #audioPlayer{{display:none;margin-bottom:12px}}
 audio{{width:100%}}
 .filter-bar{{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}}
@@ -1260,14 +1320,15 @@ audio{{width:100%}}
 </div>
 <div class="container">
     <div class="summary-bar">
-        <div class="summary-item"><div class="summary-num">{len(all_segments)}</div><div class="summary-label">总片段</div></div>
-        <div class="summary-item"><div class="summary-num" style="color:#e67e22">{unlabeled_count}</div><div class="summary-label">待打标</div></div>
-        <div class="summary-item"><div class="summary-num" style="color:#27ae60">{len(all_segments)-unlabeled_count}</div><div class="summary-label">已打标</div></div>
+        <div class="summary-item"><div class="summary-num">{total_valid}</div><div class="summary-label">总声纹片段</div></div>
+        <div class="summary-item"><div class="summary-num" style="color:#27ae60">{labeled_count}</div><div class="summary-label">已打标片段</div></div>
+        <div class="summary-item"><div class="summary-num" style="color:#e67e22">{unlabeled_count}</div><div class="summary-label">待打标片段</div></div>
     </div>
 
     <!-- 系统自动打标面板 -->
     <div class="card">
         <h2>系统自动打标</h2>
+        {recommendation_html}
         <div class="filter-bar">
             <label>模型：</label>
             <select id="autoModel" onchange="onModelChange()">
@@ -1275,6 +1336,10 @@ audio{{width:100%}}
             </select>
             <label>版本：</label>
             <select id="autoCheckpoint">{cp_opts}</select>
+            <label style="margin-left:12px">阈值：</label>
+            <input type="number" id="autoThreshold" value="0.35" min="0.1" max="0.9" step="0.05" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px">
+            <label>最少片段：</label>
+            <input type="number" id="autoMinSeg" value="2" min="1" max="10" step="1" style="width:50px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px">
             <button class="btn btn-primary" onclick="previewAutoLabel()">🔍 预览自动打标</button>
             <button class="btn" style="background:#27ae60;color:#fff" onclick="confirmAutoLabel()" id="btnConfirmAuto" disabled>💾 全部确认保存</button>
         </div>
@@ -1322,40 +1387,28 @@ function onModelChange() {{
     const mn = document.getElementById("autoModel").value;
     const cp = document.getElementById("autoCheckpoint");
     cp.innerHTML = '<option value="">-- 选择版本 --</option>';
+    var firstRecommended = null;
     checkpoints.forEach(function(c) {{
         if (!mn || c.model_name === mn) {{
             var opt = document.createElement("option");
             opt.value = c.id;
-            opt.textContent = c.id + " - " + c.model_name + " (" + c.version_tag + ")";
+            opt.textContent = c.id + " - " + c.model_name + " (" + c.version_tag + ")" + (c.recommended ? " ★推荐" : "");
+            if (c.recommended && !firstRecommended) firstRecommended = c.id;
             cp.appendChild(opt);
         }}
     }});
-}}
-
-function onLabelSelect(segId) {{
-    const sel = document.getElementById("sel-" + segId);
-    const custom = document.getElementById("custom-" + segId);
-    custom.style.display = (sel.value === "__custom__") ? "inline-block" : "none";
+    // Auto-select recommended version
+    if (firstRecommended) cp.value = firstRecommended;
 }}
 
 async function setLabel(segId) {{
-    const sel = document.getElementById("sel-" + segId);
-    const custom = document.getElementById("custom-" + segId);
-    var label = "";
+    const input = document.getElementById("sel-" + segId);
+    var label = input.value.trim();
+    if (!label) return;
     var speakerType = "";
-
-    if (sel.value === "__custom__") {{
-        label = custom.value.trim();
-        if (!label) {{ alert("请输入新说话人ID"); return; }}
-    }} else if (sel.value === "__noise__") {{
-        label = "__noise__";
+    if (label === "__noise__") {{
         speakerType = "ignored";
-    }} else if (sel.value) {{
-        label = sel.value;
-    }} else {{
-        return;
     }}
-
     try {{
         const resp = await fetch("/model-manager/segments/" + segId + "/label", {{
             method: "POST", headers:{{"Content-Type":"application/json"}},
@@ -1370,9 +1423,6 @@ async function setLabel(segId) {{
         if (r.success) {{
             var displayLabel = (label === "__noise__") ? "🔇 噪音" : label;
             document.getElementById("lbl-" + segId).textContent = displayLabel;
-            sel.value = "";
-            custom.style.display = "none";
-            custom.value = "";
         }} else {{
             alert("设置失败: " + (r.error || ""));
         }}
@@ -1397,7 +1447,13 @@ async function previewAutoLabel() {{
         const resp = await fetch("/model-manager/run-label", {{
             method: "POST",
             headers:{{"Content-Type":"application/json"}},
-            body: JSON.stringify({{checkpoint_id: parseInt(cpId), preview_only: true, model_name: document.getElementById("autoModel").value}})
+            body: JSON.stringify({{
+                checkpoint_id: parseInt(cpId),
+                preview_only: true,
+                model_name: document.getElementById("autoModel").value,
+                threshold: parseFloat(document.getElementById("autoThreshold").value) || 0.35,
+                min_segments: parseInt(document.getElementById("autoMinSeg").value) || 2,
+            }})
         }});
         const r = await resp.json();
 
@@ -1412,6 +1468,7 @@ async function previewAutoLabel() {{
         autoResults = r.results || {{}};
         var previewHtml = "";
         var matchCount = 0;
+        var newSpeakerCount = 0;
         var segIds = Object.keys(autoResults);
         for (var si = 0; si < segIds.length; si++) {{
             var segId = segIds[si];
@@ -1419,20 +1476,30 @@ async function previewAutoLabel() {{
             if (!res) continue;
             matchCount++;
 
-            // Show in the preview panel
+            // Group: "已匹配" vs "新说话人候选"
+            var isNewCandidate = res.speaker_label && res.speaker_label.startsWith("NEW_");
+            if (isNewCandidate) newSpeakerCount++;
+
+            // Detailed preview line
+            var icon = isNewCandidate ? "🆕" : "✅";
+            var reasonHtml = res.reason ? '<span style="color:#888;font-size:11px"> ' + res.reason + '</span>' : "";
             previewHtml += '<div class="preview-result">';
-            previewHtml += '  片段 #' + segId + ': <strong>' + (res.speaker_label || "?") + '</strong>';
-            previewHtml += '  置信度: ' + (res.score ? res.score.toFixed(3) : "—");
-            previewHtml += '  理由: ' + (res.reason || "—");
+            previewHtml += '  ' + icon + ' 片段#' + segId + ': <strong>' + (res.speaker_label || "?") + '</strong>';
+            previewHtml += '  相似度: ' + (res.score != null ? res.score.toFixed(3) : "—");
+            previewHtml += reasonHtml;
             previewHtml += '</div>';
 
-            // Also update the table cell
+            // Update table cell with checkbox + label + score
             var autoCell = document.getElementById("auto-" + segId);
             if (autoCell) {{
-                var acceptCheck = '<input type="checkbox" class="auto-accept" data-seg="' + segId + '" checked onchange="updateConfirmBtn()"> '
-                    + '<strong>' + (res.speaker_label || "?") + '</strong>'
-                    + ' <span style="color:#888;font-size:10px">' + (res.score ? res.score.toFixed(3) : "") + '</span>';
-                autoCell.innerHTML = acceptCheck;
+                var labelDisplay = isNewCandidate ? res.speaker_label.replace("NEW_", "🆕新:") : res.speaker_label;
+                var scoreStr = res.score != null ? res.score.toFixed(3) : "";
+                var bgColor = isNewCandidate ? "#fff3cd" : (res.score >= 0.5 ? "#d1fae5" : "#fef3c7");
+                autoCell.innerHTML = '<input type="checkbox" class="auto-accept" data-seg="' + segId + '" checked onchange="updateConfirmBtn()"> '
+                    + '<span style="background:' + bgColor + ';padding:2px 5px;border-radius:3px;font-size:11px">'
+                    + '<strong>' + labelDisplay + '</strong>'
+                    + ' <span style="color:#666">' + scoreStr + '</span>'
+                    + '</span>';
             }}
         }}
 
@@ -1441,7 +1508,11 @@ async function previewAutoLabel() {{
         }}
 
         document.getElementById("autoPreview").style.display = "block";
-        document.getElementById("autoPreviewText").innerHTML = previewHtml;
+        var summaryHtml = '<div style="margin-bottom:6px;font-size:13px">'
+            + '匹配 <strong>' + matchCount + '</strong> 段'
+            + (newSpeakerCount ? ', 其中 <strong>' + newSpeakerCount + '</strong> 段被推荐为新说话人' : '')
+            + '</div>';
+        document.getElementById("autoPreviewText").innerHTML = summaryHtml + previewHtml;
         updateConfirmBtn();
     }} catch(e) {{
         document.getElementById("autoPreview").style.display = "block";
@@ -1475,9 +1546,10 @@ async function confirmAutoLabel() {{
             method: "POST",
             headers:{{"Content-Type":"application/json"}},
             body: JSON.stringify({{
-                checkpoint_id: parseInt(document.getElementById("autoCheckpoint").value),
                 confirm_segments: toSave,
-                model_name: document.getElementById("autoModel").value
+                results: autoResults,
+                model_name: document.getElementById("autoModel").value,
+                checkpoint_id: parseInt(document.getElementById("autoCheckpoint").value),
             }})
         }});
         const r = await resp.json();

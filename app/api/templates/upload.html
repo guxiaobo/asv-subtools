@@ -699,7 +699,7 @@
                 '<tr><td>录音ID</td><td>' + (data.recording_id || '-') + '</td></tr>',
                 '<tr><td>call_id</td><td>' + (data.call_id || '-') + '</td></tr>',
                 '<tr><td>坐席工号</td><td>' + (data.agent_id || '-') + '</td></tr>',
-                '<tr><td>客户标识</td><td>' + (data.customer_phone || '-') + '</td></tr>',
+                '<tr><td>客户标识</td><td>' + (data.customer_id || '-') + '</td></tr>',
                 '<tr><td>时间戳</td><td>' + (data.call_timestamp || '-') + '</td></tr>',
                 '<tr><td>状态</td><td>' + (data.status || 'raw') + '</td></tr>',
                 '</table></div>',
@@ -734,7 +734,7 @@
                     (item.status === 'raw' ? 'raw' : 'done');
                 return '<div class="history-item">' +
                     '<span><strong>' + esc(item.agent_id || '-') + '</strong> ' +
-                    esc(item.customer_phone || '-') + '</span>' +
+                    esc(item.customer_id || '-') + '</span>' +
                     '<span><span class="status-badge ' + badgeClass + '">' +
                     esc(item.status) + '</span> ' +
                     '<span style="color:#999;font-size:12px;margin-left:6px;">' +
