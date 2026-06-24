@@ -713,16 +713,14 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
     rec_agent = (recording.get("agent_id") or "").strip()
     rec_cust = (recording.get("customer_phone") or "").strip()
 
-    # Build speaker dropdown options
-    speaker_opts = '<option value="">-- 选择说话人 --</option>'
-
-    # 预置当前录音的说话人
+    # Build datalist options for searchable input
+    dl_opts = ""
     seen_ids = set()
     if rec_agent:
-        speaker_opts += f'<option value="{rec_agent}">坐席：{rec_agent}</option>'
+        dl_opts += f'<option value="{rec_agent}">'
         seen_ids.add(rec_agent)
     if rec_cust:
-        speaker_opts += f'<option value="{rec_cust}">客户：{rec_cust}</option>'
+        dl_opts += f'<option value="{rec_cust}">'
         seen_ids.add(rec_cust)
 
     # 已有说话人（去重，跳过已预置的）
@@ -731,11 +729,10 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
         if not label or label in seen_ids:
             continue
         seen_ids.add(label)
-        sp_type = sp.get("speaker_type", "unknown")
-        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "说话人"}.get(sp_type, "说话人")
-        speaker_opts += f'<option value="{label}">{label}（{sp_t}）</option>'
+        dl_opts += f'<option value="{label}">'
 
-    speaker_opts += '<option value="__noise__">🔇 噪音/忽略</option>'
+    # 噪音/忽略作为可选值
+    dl_opts += '<option value="__noise__">'
 
     seg_rows = ""
     for seg in segments:
@@ -764,11 +761,9 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
                 <a href="javascript:void(0)" onclick="toggleIgnore({seg['id']})" id="ignore-{seg['id']}" class="{ignore_btn_class}">{ignore_btn}</a>
             </td>
             <td style="max-width:220px">
-                <select id="sel-{seg['id']}" class="speaker-select" onchange="onSpeakerSelect({seg['id']})">
-                    {speaker_opts}
-                    <option value="__new__">✏️ 新说话人...</option>
-                </select>
-                <input type="text" id="new-{seg['id']}" placeholder="新说话人ID" style="width:90px;padding:3px 6px;border:1px solid #ddd;border-radius:3px;font-size:12px;display:none">
+                <input type="text" id="sel-{seg['id']}" class="speaker-search" list="dl-{seg['id']}"
+                       placeholder="搜索或输入说话人ID" value="{current_label}">
+                <datalist id="dl-{seg['id']}">{dl_opts}</datalist>
                 <button class="btn-sm" style="background:#8e44ad" onclick="setLabel({seg['id']})">设置</button>
             </td>
         </tr>"""
@@ -878,9 +873,33 @@ const audioPlayer = document.getElementById('audioPlayer');
 const player = document.getElementById('player');
 
 function playAudio(segId) {{
-    audioPlayer.style.display = 'block';
-    player.src = '/model-manager/segments/audio/' + segId;
-    player.play();
+    fetch('/model-manager/segments/' + segId + '/stream')
+        .then(r => r.blob())
+        .then(blob => {{
+            audioPlayer.style.display = 'block';
+            player.src = URL.createObjectURL(blob);
+            player.play();
+        }});
+}}
+
+async function setLabel(segId) {{
+    const input = document.getElementById('sel-' + segId);
+    let label = input.value.trim();
+    if (!label) return;
+    let speakerType = '';
+    if (label === '__noise__') {{
+        speakerType = 'ignored';
+    }}
+    try {{
+        const resp = await fetch('/model-manager/set-label', {{
+            method:'POST',
+            headers:{{'Content-Type':'application/json'}},
+            body:JSON.stringify({{segment_id: segId, speaker_label: label, speaker_type: speakerType}})
+        }});
+        const result = await resp.json();
+        if (result.success) location.reload();
+        else alert('设置失败: ' + (result.error || ''));
+    }} catch(e) {{ alert('网络错误: ' + e.message); }}
 }}
 
 async function toggleIgnore(segId) {{
@@ -889,52 +908,6 @@ async function toggleIgnore(segId) {{
         const result = await resp.json();
         if (result.success) location.reload();
         else alert('操作失败');
-    }} catch(e) {{ alert('网络错误: ' + e.message); }}
-}}
-
-function onSpeakerSelect(segId) {{
-    const sel = document.getElementById('sel-' + segId);
-    const newInput = document.getElementById('new-' + segId);
-    newInput.style.display = (sel.value === '__new__') ? 'inline-block' : 'none';
-}}
-
-async function setLabel(segId) {{
-    const sel = document.getElementById('sel-' + segId);
-    const newInput = document.getElementById('new-' + segId);
-    let label = '';
-    let speakerType = '';
-    
-    if (sel.value === '__new__') {{
-        label = newInput.value.trim();
-        if (!label) {{ alert('请输入新说话人ID'); return; }}
-    }} else if (sel.value === '__noise__') {{
-        label = '__noise__';
-        speakerType = 'ignored';
-    }} else if (sel.value) {{
-        label = sel.value;
-    }} else {{
-        return;
-    }}
-    
-    try {{
-        const resp = await fetch('/model-manager/segments/' + segId + '/label', {{ 
-            method:'POST',
-            headers:{{'Content-Type':'application/json'}},
-            body:JSON.stringify({{
-                speaker_label: label,
-                label_source: 'manual',
-                speaker_type: speakerType,
-                update_trained_status: true
-            }})
-        }});
-        const result = await resp.json();
-        if (result.success) {{
-            const displayLabel = label === '__noise__' ? '🔇 噪音' : label;
-            document.getElementById('label-' + segId).textContent = displayLabel;
-            sel.value = '';
-            newInput.style.display = 'none';
-            newInput.value = '';
-        }} else alert('设置失败: ' + (result.error || ''));
     }} catch(e) {{ alert('网络错误: ' + e.message); }}
 }}
 
