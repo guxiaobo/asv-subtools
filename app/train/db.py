@@ -85,6 +85,7 @@ def _ensure_legacy_columns(conn: sqlite3.Connection) -> None:
         "pre_result": "TEXT",
         "pre_error": "TEXT",
         "pre_finished_at": "TEXT",
+        "pre_queued_at": "TEXT",
         "train_status": "TEXT DEFAULT 'pending'",
         "train_result": "TEXT",
         "train_error": "TEXT",
@@ -131,7 +132,8 @@ def claim_pending_recordings(conn: sqlite3.Connection, limit: int = 1) -> List[D
     ids = [r["id"] for r in rows]
     placeholders = ",".join("?" for _ in ids)
     conn.execute(
-        f"UPDATE recordings SET pre_status = 'processing' WHERE id IN ({placeholders})",
+        f"UPDATE recordings SET pre_status = 'processing', pre_queued_at = NULL "
+        f"WHERE id IN ({placeholders})",
         ids,
     )
     conn.commit()
@@ -148,33 +150,46 @@ def update_pre_status(
 ) -> None:
     """Update the preprocess status for a recording."""
     now = datetime.now().isoformat()
-    if status == "done":
+    # done / unsegmentable 都表示 VAD 流程正常完成，记 pre_result + pre_finished_at
+    # unsegmentable: VAD 跑完但无语音段（静音/纯噪声），仍属"预处理完成"
+    if status in ("done", "unsegmentable"):
         conn.execute(
             """UPDATE recordings
-               SET pre_status=?, pre_result=?, pre_finished_at=?, status='preprocessed'
+               SET pre_status=?, pre_result=?, pre_finished_at=?, pre_queued_at=NULL,
+                   status='preprocessed'
                WHERE id=?""",
             (status, json.dumps(pre_result) if pre_result else None, now, rec_id),
         )
     elif status == "failed":
         conn.execute(
             """UPDATE recordings
-               SET pre_status=?, pre_result=?, pre_error=?, pre_finished_at=?
+               SET pre_status=?, pre_result=?, pre_error=?, pre_finished_at=?, pre_queued_at=NULL
                WHERE id=?""",
             (status, json.dumps(pre_result) if pre_result else None, pre_error, now, rec_id),
         )
     else:
         conn.execute(
-            "UPDATE recordings SET pre_status=? WHERE id=?", (status, rec_id)
+            "UPDATE recordings SET pre_status=?, pre_queued_at=NULL WHERE id=?",
+            (status, rec_id),
         )
     conn.commit()
 
 
 def count_pending_preprocess(conn: sqlite3.Connection) -> int:
     """Count recordings waiting for preprocessing."""
-    row = conn.execute(
+    cur = conn.execute(
         "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status='pending' OR pre_status='failed'"
-    ).fetchone()
+    )
+    row = cur.fetchone()
     return row["cnt"] if row else 0
+
+
+def get_recording_by_id(conn: sqlite3.Connection, rec_id: int) -> Optional[Dict[str, Any]]:
+    """Look up a recording by its primary key id."""
+    row = conn.execute(
+        "SELECT * FROM recordings WHERE id = ?", (rec_id,)
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def count_pending_train(conn: sqlite3.Connection) -> int:
@@ -234,9 +249,15 @@ def update_train_status(
 
 
 def recover_stuck_tasks(conn: sqlite3.Connection) -> int:
-    """Reset any stuck 'processing' recordings back to 'pending'."""
+    """Reset any stuck 'processing' recordings back to 'pending'.
+
+    记录 pre_queued_at 为恢复时间，界面据此提示"异常恢复，建议重试"。
+    """
+    now = datetime.now().isoformat()
     count = conn.execute(
-        "UPDATE recordings SET pre_status='pending' WHERE pre_status='processing'"
+        "UPDATE recordings SET pre_status='pending', pre_queued_at=? "
+        "WHERE pre_status='processing'",
+        (now,),
     ).rowcount
     count += conn.execute(
         "UPDATE recordings SET train_status='pending' WHERE train_status='training'"

@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
+import html
+import pathlib
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
 from services.auth import get_current_user, is_logged_in, require_role
 
 ROLE_MODEL_MANAGER = "model_manager"
@@ -51,6 +56,7 @@ DEFAULT_VAD_CONFIG = {
     "diarizer_model": "CAM++",
     "diarizer_cluster_threshold": 0.55,
     "diarizer_agent_threshold": None,
+    "min_segment_sec_ignore": 0.0,  # <= 此值时自动忽略片段（0=不启用）
 }
 
 
@@ -82,6 +88,33 @@ def _recordings_db():
     else:
         db = sys.modules["services.recording_db"]
     return db
+
+
+# ── 分段结果版本删除 ──
+
+
+@router.delete("/model-manager/segments/{recording_id}/batch/{batch_id}")
+async def delete_segmentation_batch(
+    recording_id: int,
+    batch_id: str,
+    request: Request,
+):
+    """删除录音某版本的分段结果（需安全确认）。"""
+    await require_role(ROLE_MODEL_MANAGER)(request)
+    db = _recordings_db()
+    try:
+        check = await db.is_batch_deletable(recording_id, batch_id)
+        if not check.get("safe"):
+            refs = check.get("referenced_by", [])
+            msg = f"该版本 {check['seg_count']} 段中有片段已被以下模型使用，无法删除："
+            for r in refs:
+                msg += f"\n  · {r['model_name']} ({r['version_tag']})"
+            return {"success": False, "error": msg, "details": check}
+        count = await db.delete_batch_segments(recording_id, batch_id)
+        return {"success": True, "deleted": count}
+    except Exception as e:
+        logger.exception("delete batch failed")
+        return {"success": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +175,13 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-seri
                 <span class="hint">值越高越敏感</span>
             </div>
             <div class="form-row">
-                <label>最小片段时长 (秒)</label>
+                <label>最小时长 (秒)</label>
                 <input type="number" name="min_segment_sec" value="{cfg['min_segment_sec']}" min="0.5" max="60" step="0.1">
+            </div>
+            <div class="form-row">
+                <label>自动忽略短于 (秒)</label>
+                <input type="number" name="min_segment_sec_ignore" value="{cfg.get('min_segment_sec_ignore', 0)}" min="0" max="60" step="0.1">
+                <span class="hint">0=不启用，>0 时长低于此值的片段自动忽略</span>
             </div>
             <div class="form-row">
                 <label>最大片段时长 (秒)</label>
@@ -196,7 +234,7 @@ async function saveConfig(e) {{
     new FormData(form).forEach((v, k) => {{ 
         if (k === 'apply_noise_reduction') data[k] = true;
         else if (k === 'diarizer_agent_threshold' && !v) data[k] = null;
-        else if (['vad_threshold','min_segment_sec','max_segment_sec','snr_threshold','filter_leading_sec','target_sample_rate','window_ms','diarizer_cluster_threshold'].includes(k))
+        else if (['vad_threshold','min_segment_sec','max_segment_sec','snr_threshold','filter_leading_sec','target_sample_rate','window_ms','diarizer_cluster_threshold','min_segment_sec_ignore'].includes(k))
             data[k] = parseFloat(v);
         else data[k] = v;
     }});
@@ -275,7 +313,7 @@ async def segment_manager_page(
     except Exception as e:
         logger.error("Failed to load recordings: %s", e)
         seg_stats = {"total_recordings": 0, "segmented": 0,
-                     "labeled": 0, "unsegmented": 0, "unlabeled": 0}
+                     "labeled": 0, "pending": 0, "unsegmentable": 0, "unlabeled": 0}
 
     # Get agent list for filter dropdown
     agents = []
@@ -292,6 +330,67 @@ async def segment_manager_page(
     return HTMLResponse(page)
 
 
+import html
+from datetime import datetime
+
+
+def _pending_hint(pre_status: str, pre_queued_at: Optional[str]) -> str:
+    """根据 pre_status + pre_queued_at 时长生成进度提示（方案A）。
+
+    返回内联 HTML 片段，追加在 VAD 状态徽章后。规则：
+      - done/failed/其他非活跃状态：无提示
+      - pending（首次断句派发）：
+          · pre_queued_at 为空（老数据）：待处理
+          · <2 分钟：⏳ 等待处理中…
+          · 2~5 分钟：⏳ 处理较慢，请稍候（橙）
+          · ≥5 分钟：⚠ 可能超时，建议重试（红）
+      - reprocessing（重新断句已派发，等待脚本启动）：
+          同 pending 时长规则，但文案前缀"重新断句"
+      - processing（脚本正在执行 VAD/diarize）：
+          · 永远显示 🔄 处理中…（蓝），不计算超时
+            （processing 由脚本写入，一旦进入说明 claim 成功，时长不反映卡死；
+             卡死时 recover 会把它转回 reprocessing 并记时间戳）
+    """
+    # processing：脚本正在跑，无法按 queued_at 判断超时（claim 时已清空）
+    if pre_status == "processing":
+        return '<span style="font-size:11px;color:#3498db;margin-left:4px">🔄 处理中…</span>'
+
+    # pending / reprocessing：基于 pre_queued_at 时长判断
+    if pre_status not in ("pending", "reprocessing"):
+        return ""
+
+    prefix = "重新断句：" if pre_status == "reprocessing" else ""
+
+    if not pre_queued_at:
+        return f'<span style="font-size:11px;color:#999;margin-left:4px">{prefix}待处理</span>'
+    try:
+        queued = datetime.fromisoformat(pre_queued_at)
+        elapsed = (datetime.now() - queued).total_seconds()
+    except (ValueError, TypeError):
+        return f'<span style="font-size:11px;color:#999;margin-left:4px">{prefix}待处理</span>'
+    if elapsed < 120:
+        return f'<span style="font-size:11px;color:#3498db;margin-left:4px">⏳ {prefix}等待处理中…</span>'
+    elif elapsed < 300:
+        return f'<span style="font-size:11px;color:#e67e22;margin-left:4px">⏳ {prefix}处理较慢，请稍候</span>'
+    else:
+        return f'<span style="font-size:11px;color:#e74c3c;margin-left:4px">⚠ {prefix}可能超时，建议重试</span>'
+
+
+def _seg_view_link(rec: dict, batch: str, can_segment: bool, pre_status: str = "") -> str:
+    """生成录音片段详情链接。
+
+    - done: 蓝色"查看片段"可点击
+    - unsegmentable: 灰色"无法断句"不可点击（VAD 已分析但无语音段）
+    - 其他（pending/processing 等）: 灰色"未断句"不可点击
+    """
+    if can_segment:
+        url = f'/model-manager/segments/{rec["id"]}?batch={batch}'
+        return f'<a href="{html.escape(url)}" class="btn-sm" style="background:#3498db">查看片段</a>'
+    if pre_status == "unsegmentable":
+        return '<span class="btn-sm" style="background:#7f8c8d;cursor:default">无法断句</span>'
+    return '<span class="btn-sm" style="background:#95a5a6;cursor:default">未断句</span>'
+
+
 def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
                          agent_id, customer_phone, date_from, date_to, status,
                          current_page, total_pages, total_count, has_filter):
@@ -305,6 +404,7 @@ def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
         batch = rec.get("latest_batch", "v1")
 
         status_color = {"pending": "#f39c12", "processing": "#3498db",
+                        "reprocessing": "#9b59b6", "unsegmentable": "#7f8c8d",
                         "done": "#27ae60", "failed": "#e74c3c"}.get(pre_status, "#95a5a6")
 
         seg_info = f"{seg_count} 段"
@@ -312,18 +412,34 @@ def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
             seg_info += f' <span style="color:#e74c3c">({seg_ignored} 忽略)</span>'
 
         can_segment = pre_status == "done"
+        # checkbox 可选/灰掉规则：
+        #   pending 无 pre_queued_at → 可勾选（从未提交，新鲜录音）
+        #   pending 有 pre_queued_at → 灰掉（已提交，等待 VAD 处理中）
+        #   reprocessing/processing → 灰掉（正在处理中）
+        #   unsegmentable → 灰掉（无法断句）
+        #   done/failed → 可勾选（可重新提交）
+        queued = bool(rec.get("pre_queued_at"))
+        checkbox_disabled = (
+            pre_status in ("reprocessing","processing","unsegmentable")
+            or (pre_status == "pending" and queued)
+        )
+        chk = f'<input type="checkbox" class="rec-check" value="{rec["id"]}" data-status="{pre_status}"'
+        if checkbox_disabled:
+            chk += ' disabled'
+        chk += '>'
+        vad_hint = _pending_hint(pre_status, rec.get("pre_queued_at"))
         rows_html += f"""<tr>
-            <td><input type="checkbox" class="rec-check" value="{rec['id']}" data-status="{pre_status}" {"" if can_segment else "disabled"}></td>
+            <td>{chk}</td>
             <td>{rec.get('id','')}</td>
             <td>{rec.get('agent_id','')}</td>
             <td>{rec.get('customer_phone','')}</td>
             <td>{rec.get('call_timestamp','')[:16]}</td>
             <td>{rec.get('call_id','')}</td>
-            <td><span style="color:{status_color};font-weight:bold">{pre_status}</span></td>
+            <td><span style="color:{status_color};font-weight:bold">{pre_status}</span>{vad_hint}</td>
             <td>{seg_info}</td>
             <td>
-                <a href="/model-manager/segments/{rec['id']}?batch={batch}" class="btn-sm" style="background:#3498db">查看片段</a>
-                {"" if can_segment else "<span class='btn-sm' style='background:#95a5a6;cursor:default'>预处</span>"}
+                {_seg_view_link(rec, batch, can_segment, pre_status)}
+                {"" if can_segment else ""}
             </td>
         </tr>"""
 
@@ -334,7 +450,8 @@ def _render_segment_page(user, recordings, seg_stats, agents, vad_cfg,
     agent_opts = '<option value="">全部坐席</option>'
     for a in agents:
         sel = 'selected' if a.get('agent_id','') == agent_id else ''
-        agent_opts += f'<option value="{a["agent_id"]}" {sel}>{a.get("display_name","") or a["agent_id"]}</option>'
+        name = html.escape(str(a.get("display_name", "") or a.get("agent_id", "")))
+        agent_opts += f'<option value="{html.escape(str(a["agent_id"]))}" {sel}>{name}</option>'
 
     # Pagination
     pag_html = ""
@@ -384,6 +501,8 @@ tr:hover {{ background:#f8f9fa }}
 .summary-label {{ font-size:12px; color:#777; margin-top:4px }}
 .pagination {{ display:flex; align-items:center; justify-content:center; gap:12px; margin-top:16px; padding:12px 0 }}
 .page-info {{ font-size:13px; color:#666 }}
+input[type=checkbox]:disabled {{ opacity:0.35; cursor:not-allowed }}
+input[type=checkbox]:disabled+label {{ color:#999 }}
 </style></head>
 <body>
 <div class="nav">
@@ -402,19 +521,23 @@ tr:hover {{ background:#f8f9fa }}
         </div>
         <div class="summary-item">
             <div class="summary-num">{seg_stats.get("segmented",0)}</div>
-            <div class="summary-label">已断句</div>
+            <div class="summary-label">已断句录音</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-num" style="color:{'#e67e22' if seg_stats.get('pending',0)>0 else '#27ae60'}">{seg_stats.get("pending",0)}</div>
+            <div class="summary-label">未断句录音</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-num" style="color:{'#e74c3c' if seg_stats.get('unsegmentable',0)>0 else '#27ae60'}">{seg_stats.get("unsegmentable",0)}</div>
+            <div class="summary-label">无法断句</div>
         </div>
         <div class="summary-item">
             <div class="summary-num">{seg_stats.get("labeled",0)}</div>
-            <div class="summary-label">已打标</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-num" style="color:{'#e67e22' if seg_stats.get('unsegmented',0)>0 else '#27ae60'}">{seg_stats.get("unsegmented",0)}</div>
-            <div class="summary-label">未断句</div>
+            <div class="summary-label">已打标片段</div>
         </div>
         <div class="summary-item">
             <div class="summary-num" style="color:{'#dc2626' if seg_stats.get('unlabeled',0)>0 else '#16a34a'}">{seg_stats.get("unlabeled",0)}</div>
-            <div class="summary-label">未打标</div>
+            <div class="summary-label">未打标片段</div>
         </div>
     </div>
 
@@ -427,7 +550,7 @@ tr:hover {{ background:#f8f9fa }}
             </div>
             <div>
                 <label style="display:block">客户</label>
-                <input type="text" name="customer_phone" value="{customer_phone}" placeholder="电话号码">
+                <input type="text" name="customer_phone" value="{customer_phone}" placeholder="客户ID">
             </div>
             <div>
                 <label style="display:block">日期从</label>
@@ -441,11 +564,10 @@ tr:hover {{ background:#f8f9fa }}
                 <label style="display:block">状态</label>
                 <select name="status">
                     <option value="">全部</option>
-                    <option value="pending_segment" {"selected" if status=='pending_segment' else ""}>待断句</option>
-                    <option value="segmented" {"selected" if status=='segmented' else ""}>已断句</option>
-                    <option value="done" {"selected" if status=='done' else ""}>预处理完成</option>
-                    <option value="pending" {"selected" if status=='pending' else ""}>待处理</option>
-                    <option value="failed" {"selected" if status=='failed' else ""}>失败</option>
+                    <option value="done" {"selected" if status=='done' else ""}>已断句</option>
+                    <option value="pending" {"selected" if status=='pending' else ""}>未断句</option>
+                    <option value="unsegmentable" {"selected" if status=='unsegmentable' else ""}>无法断句</option>
+                    <option value="failed" {"selected" if status=='failed' else ""}>处理异常</option>
                 </select>
             </div>
             <div>
@@ -501,7 +623,7 @@ async function runVad() {{
     if (ids.length === 0) {{ alert('请先选择待断句的录音'); return; }}
     if (!confirm('确定对选中的 ' + ids.length + ' 条录音执行断句吗？')) return;
     var btn = document.getElementById('runVadBtn');
-    btn.disabled = true; btn.textContent = '处理中...';
+    btn.disabled = true; btn.textContent = '提交中...';
     try {{
         var resp = await fetch('/model-manager/run-preprocess', {{
             method:'POST',
@@ -510,7 +632,8 @@ async function runVad() {{
         }});
         var result = await resp.json();
         if (result.success) {{
-            alert('断句任务已启动: ' + (result.message || ''));
+            alert('断句任务已提交，刷新后查看进度。');
+            btn.textContent = '✅ 已提交…';
             location.reload();
         }} else {{
             alert('启动失败: ' + (result.error || JSON.stringify(result)));
@@ -546,7 +669,6 @@ async def recording_segments_page(
     segments = []
     batches = []
     try:
-        # Query recording directly by ID
         conn = await db._open_conn()
         try:
             cursor = await conn.execute(
@@ -560,14 +682,13 @@ async def recording_segments_page(
         if not batch:
             batch = await db.get_latest_batch_for_recording(recording_id)
         segments = await db.get_segments_by_recording(recording_id, batch_id=batch)
-        batches = await db.get_batches_for_recording(recording_id)
+        batches = await db.get_batches_with_counts(recording_id)
     except Exception as e:
         logger.error("Failed to load segments for recording %d: %s", recording_id, e)
 
     if not recording:
         return HTMLResponse("<h1>录音不存在</h1><a href='/model-manager/segments'>返回</a>", status_code=404)
 
-    # Get existing speakers for dropdown
     existing_speakers = []
     try:
         existing_speakers = await db.list_speakers_from_segments()
@@ -588,13 +709,32 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
     user = user or {}
     existing_speakers = existing_speakers or []
 
-    # Build speaker dropdown options from existing speakers
-    speaker_opts = '<option value="">-- 选择已有说话人 --</option>'
+    # 收集当前录音本身的坐席ID和客户ID（作为快速选项）
+    rec_agent = (recording.get("agent_id") or "").strip()
+    rec_cust = (recording.get("customer_phone") or "").strip()
+
+    # Build speaker dropdown options
+    speaker_opts = '<option value="">-- 选择说话人 --</option>'
+
+    # 预置当前录音的说话人
+    seen_ids = set()
+    if rec_agent:
+        speaker_opts += f'<option value="{rec_agent}">坐席：{rec_agent}</option>'
+        seen_ids.add(rec_agent)
+    if rec_cust:
+        speaker_opts += f'<option value="{rec_cust}">客户：{rec_cust}</option>'
+        seen_ids.add(rec_cust)
+
+    # 已有说话人（去重，跳过已预置的）
     for sp in existing_speakers:
-        label = sp.get("speaker_label", "") or sp.get("id", "")
+        label = (sp.get("speaker_label") or "").strip()
+        if not label or label in seen_ids:
+            continue
+        seen_ids.add(label)
         sp_type = sp.get("speaker_type", "unknown")
-        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "未知"}.get(sp_type, sp_type)
-        speaker_opts += f'<option value="{label}">{label} ({sp_t})</option>'
+        sp_t = {"agent": "坐席", "customer": "客户", "unknown": "说话人"}.get(sp_type, "说话人")
+        speaker_opts += f'<option value="{label}">{label}（{sp_t}）</option>'
+
     speaker_opts += '<option value="__noise__">🔇 噪音/忽略</option>'
 
     seg_rows = ""
@@ -636,11 +776,23 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
     if not segments:
         seg_rows = "<tr><td colspan='8' style='text-align:center;color:#999;padding:30px'>暂无断句片段，请先执行 VAD 断句</td></tr>"
 
-    # Batch selector
+    # Batch selector — batches is list of dicts from get_batches_with_counts
     batch_opts = ""
-    for b in batches:
-        sel = "selected" if b == current_batch else ""
-        batch_opts += f'<option value="{b}" {sel}>第 {b.upper()} 次</option>'
+    total = len(batches)
+    for idx, b in enumerate(batches):
+        bid = b["batch_id"]
+        seg_count = b["seg_count"]
+        is_latest = b.get("is_latest", False)
+        version_num = total - idx  # 最新=版本1
+        # 提取时间戳批次的日期部分显示在 tooltip 中
+        date_str = ""
+        if bid.startswith("v") and len(bid) > 9 and bid[1:9].isdigit():
+            date_str = f"（{bid[1:5]}-{bid[5:7]}-{bid[7:9]}）"
+        label = f"版本 {version_num}{date_str}"
+        if is_latest:
+            label += " ✨最新"
+        sel = "selected" if bid == current_batch else ""
+        batch_opts += f'<option value="{bid}" {sel}>{label}（{seg_count}段）</option>'
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -668,7 +820,7 @@ tr.seg-ignored td {{ color:#999; text-decoration:line-through }}
 .btn {{ padding:7px 16px; border:none; border-radius:5px; cursor:pointer; font-size:13px; text-decoration:none; display:inline-block }}
 .btn-primary {{ background:#3498db; color:#fff }}
 .btn-primary:hover {{ background:#2980b9 }}
-.btn-sm {{ padding:4px 10px; border:none; border-radius:4px; cursor:pointer; font-size:12px; color:#fff; display:inline-block }}
+.btn-sm {{ padding:4px 10px; border:none; border-radius:4px; cursor:pointer; font-size:12px; color:#fff; background:#7f8c8d; display:inline-block; text-decoration:none }}
 .btn-sm-warning {{ background:#e67e22 !important }}
 audio {{ width:100%; margin-top:8px }}
 .batch-select {{ padding:6px 10px; border:1px solid #ddd; border-radius:5px; font-size:13px; margin-right:8px }}
@@ -704,6 +856,7 @@ audio {{ width:100%; margin-top:8px }}
                 {batch_opts}
             </select>
             <button class="btn btn-primary" onclick="reprocessRecording()">🔁 重新断句</button>
+            <button class="btn btn-sm" style="background:#e74c3c;margin-left:8px" onclick="deleteBatch()">🗑 删除此版本</button>
         </div>
     </div>
 
@@ -803,6 +956,20 @@ async function reprocessRecording() {{
         else alert('启动失败: ' + (result.error || ''));
         btn.disabled = false; btn.textContent = '🔁 重新断句';
     }} catch(e) {{ alert('网络错误: ' + e.message); btn.disabled = false; btn.textContent = '🔁 重新断句'; }}
+}}
+
+async function deleteBatch() {{
+    const sel = document.querySelector('.batch-select');
+    const batch = sel ? sel.value : '';
+    if (!batch || !confirm('确定要删除断句版本「' + sel.options[sel.selectedIndex].text + '」吗？此操作不可恢复。')) return;
+    const btn = event && event.target; if (btn) {{ btn.disabled = true; btn.textContent = '删除中...'; }}
+    try {{
+        const resp = await fetch('/model-manager/segments/{recording_id}/batch/' + encodeURIComponent(batch), {{ method:'DELETE' }});
+        const result = await resp.json();
+        if (result.success) {{ alert('已删除 ' + result.deleted + ' 段'); location.reload(); }}
+        else alert('删除失败: ' + (result.error || ''));
+        if (btn) {{ btn.disabled = false; btn.textContent = '🗑 删除此版本'; }}
+    }} catch(e) {{ alert('网络错误: ' + e.message); if (btn) {{ btn.disabled = false; btn.textContent = '🗑 删除此版本'; }} }}
 }}
 </script>
 </body>

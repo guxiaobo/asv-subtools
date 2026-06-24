@@ -68,16 +68,12 @@
         <div class="card">
             <h3>🎙️ 录音信息</h3>
             <div class="stat-row">
-                <span class="label">待断句</span>
-                <span class="value highlight">{{ stats.pending_vad }}</span>
-            </div>
-            <div class="stat-row">
-                <span class="label">最近7日新上传</span>
-                <span class="value">{{ stats.new_7d }}</span>
-            </div>
-            <div class="stat-row">
                 <span class="label">已断句录音</span>
                 <span class="value">{{ stats.segmented_recordings }}</span>
+            </div>
+            <div class="stat-row">
+                <span class="label">待断句录音</span>
+                <span class="value highlight">{{ stats.pending_vad }}</span>
             </div>
             <div class="stat-row">
                 <span class="label">声纹片段总数</span>

@@ -404,6 +404,19 @@ async def run_preprocess(request: Request):
     except Exception:
         pass
     try:
+        from services.recording_db import set_pre_statuses
+
+        # 先将选中录音的 pre_status 设为 pending，让脚本自动拾取
+        ids_to_run = []
+        if recording_ids:
+            ids_to_run = recording_ids
+        elif recording_id:
+            ids_to_run = [recording_id]
+
+        # 检查各录音是否有现有片段
+        from services.recording_db import get_segment_count_for_recordings
+        seg_counts = await get_segment_count_for_recordings(ids_to_run) if ids_to_run else {}
+
         # 调用训练系统的预处理脚本
         script = project_root / "train" / "preprocess.py"
         if not script.exists():
@@ -413,23 +426,71 @@ async def run_preprocess(request: Request):
             }, status_code=500)
 
         env = _train_env()
-        results = []
-        # 支持多录音批量预处理
-        ids_to_run = []
-        if recording_ids:
-            ids_to_run = recording_ids
-        elif recording_id:
-            ids_to_run = [recording_id]
 
-        if not ids_to_run:
-            # 无指定 ID，处理所有待处理录音
-            ids_to_run = None  # script handles all
+        from datetime import datetime
+        batch_id = datetime.now().strftime("v%Y%m%d_%H%M%S")
 
-        args = [sys.executable, str(script)]
-        if ids_to_run:
-            for rid in ids_to_run:
-                args.extend(["--recording-id", str(rid)])
+        # 读取 VAD 配置中的 min_segment_sec_ignore
+        vad_cfg_path = project_root / "data" / "vad_config.json"
+        min_ignore_arg = ""
+        try:
+            if vad_cfg_path.exists():
+                vad_cfg = json.loads(vad_cfg_path.read_text())
+                mi = float(vad_cfg.get("min_segment_sec_ignore", 0.0))
+                if mi > 0:
+                    min_ignore_arg = f"--min-ignore={mi}"
+        except Exception:
+            pass
 
+        first_time_ids = [rid for rid in ids_to_run if seg_counts.get(rid, 0) == 0]
+        reseg_ids = [rid for rid in ids_to_run if seg_counts.get(rid, 0) > 0]
+
+        bg_tasks = []
+
+        # 首次断句录音：设 pending，让脚本批量 claim
+        if first_time_ids:
+            await set_pre_statuses(first_time_ids, "pending")
+            args_bt = [sys.executable, str(script), "--batch-id", batch_id]
+            if min_ignore_arg:
+                args_bt.append(min_ignore_arg)
+            bg_tasks.append(_run_preprocess_in_bg(args_bt, env))
+
+        # 重新断句录音：设 reprocessing 让界面显示"重新断句中"，process_single 入口会转为 processing
+        if reseg_ids:
+            await set_pre_statuses(reseg_ids, "reprocessing")
+        for rid in reseg_ids:
+            args_re = [sys.executable, str(script), "--recording-id", str(rid), "--batch-id", batch_id]
+            if min_ignore_arg:
+                args_re.append(min_ignore_arg)
+            bg_tasks.append(_run_preprocess_in_bg(args_re, env))
+
+        # 有任务则启动
+        if bg_tasks:
+            for t in bg_tasks:
+                asyncio.create_task(t)
+
+        msg_parts = []
+        if first_time_ids:
+            msg_parts.append(f"{len(first_time_ids)} 条首次断句")
+        if reseg_ids:
+            msg_parts.append(f"{len(reseg_ids)} 条重新断句（batch={batch_id}）")
+
+        return {
+            "success": True,
+            "message": f"预处理任务已启动：{'、'.join(msg_parts)}，请稍后刷新页面查看结果",
+            "batch_id": batch_id,
+        }
+    except Exception as e:
+        logger.exception("Preprocess error")
+        return JSONResponse({
+            "success": False,
+            "error": str(e),
+        }, status_code=500)
+
+
+async def _run_preprocess_in_bg(args: List[str], env: dict) -> None:
+    """后台执行预处理脚本。"""
+    try:
         result = await asyncio.to_thread(
             subprocess.run,
             args,
@@ -439,25 +500,15 @@ async def run_preprocess(request: Request):
             timeout=3600,
             env=env,
         )
-        logger.info("Preprocess result: stdout=%s stderr=%s", result.stdout, result.stderr)
-
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout[-2000:] if result.stdout else "",
-            "stderr": result.stderr[-2000:] if result.stderr else "",
-            "returncode": result.returncode,
-        }
+        if result.returncode == 0:
+            logger.info("后台预处理完成: stdout=%s", result.stdout[-500:])
+        else:
+            logger.error("后台预处理失败 rc=%d: stderr=%s",
+                         result.returncode, result.stderr[-2000:])
     except subprocess.TimeoutExpired:
-        return JSONResponse({
-            "success": False,
-            "error": "预处理超时（3600s）",
-        }, status_code=500)
+        logger.error("后台预处理超时")
     except Exception as e:
-        logger.exception("Preprocess error")
-        return JSONResponse({
-            "success": False,
-            "error": str(e),
-        }, status_code=500)
+        logger.exception("后台预处理异常")
 
 
 @router.post("/model-manager/run-label")

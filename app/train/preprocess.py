@@ -60,7 +60,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--call-id", type=str, default=None,
-        help="处理指定 call_id 的单条录音",
+        help="处理指定 call_id 的录音（单条模式）",
+    )
+    parser.add_argument(
+        "--recording-id", type=int, default=None,
+        help="处理指定 recording.id 的录音（单条模式）",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -81,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config", type=str, default=None,
         help="配置文件路径",
+    )
+    parser.add_argument(
+        "--batch-id", type=str, default=None,
+        help="断句版本号（如 v2/v3），不传则使用当前最新版本 +1",
+    )
+    parser.add_argument(
+        "--min-ignore", type=float, default=None,
+        help="自动忽略短于该秒数的片段（0=不启用）",
     )
     # ── Diarizer options ──
     parser.add_argument(
@@ -117,11 +129,13 @@ def process_single(
     preprocessed_root: str,
     vad_kwargs: dict,
     diarizer_kwargs: Optional[dict] = None,
+    batch_id: str = "v1",
 ) -> int:
     """
     处理单条录音。
     Args:
         diarizer_kwargs: diarizer 参数（传给 preprocess_recording）。
+        batch_id: 断句版本号，用于多版本保留。
     Returns: 0 成功, 1 失败。
     """
     rec_id = row["id"]
@@ -147,6 +161,8 @@ def process_single(
 
         # Remove preprocessed results from output_dir key
         preprocess_kwargs = {"audio_path": audio_path, "output_dir": str(output_dir)}
+        # 取出仅供 process_single 使用的参数（不会传给 preprocess_recording/energy_vad）
+        min_ignore = vad_kwargs.pop("min_segment_sec_ignore", 0.0)
         preprocess_kwargs.update(vad_kwargs)
         if diarizer_kwargs:
             preprocess_kwargs.update(diarizer_kwargs)
@@ -156,16 +172,17 @@ def process_single(
 
         # ── Write segment metadata to audio_segments table ──
         segment_details = result.get("segment_details", [])
+        seg_count = len(segment_details)
         if segment_details:
             from data.models import AudioSegmentCreate
 
             seg_repo = SegmentRepo(conn)
-            # Remove old segments for this recording (in case of re-run)
-            seg_repo.delete_by_recording(rec_id)
+            # 多版本保留：不删除旧版本，新写入采用 batch_id 区分
             seg_entries = [
                 AudioSegmentCreate(
                     recording_id=rec_id,
                     segment_index=i,
+                    batch_id=batch_id,
                     file_path=sd["file_path"],
                     start_sec=sd["start_sec"],
                     end_sec=sd["end_sec"],
@@ -173,14 +190,31 @@ def process_single(
                 )
                 for i, sd in enumerate(segment_details)
             ]
+
+            # ── 自动忽略短片段 ──
+            if min_ignore > 0:
+                ignored_count = 0
+                for entry in seg_entries:
+                    if entry.duration_sec < min_ignore:
+                        entry.is_ignored = 1
+                        entry.speaker_type = "ignored"
+                        ignored_count += 1
+                if ignored_count:
+                    logger.info(
+                        "自动忽略 %d/%d 段（时长 < %.1f秒）",
+                        ignored_count, len(seg_entries), min_ignore,
+                    )
+
             seg_repo.insert_batch([s.model_dump() for s in seg_entries])
         else:
             logger.warning("No segment_details in result (writing zero segments)")
 
-        update_pre_status(conn, rec_id, "done", pre_result=result)
+        # VAD 正常跑完但无语音段 → 标记为"无法断句"，与"未断句"区分
+        final_status = "unsegmentable" if seg_count == 0 else "done"
+        update_pre_status(conn, rec_id, final_status, pre_result=result)
         logger.info(
-            "Done: id=%d call=%s segments=%d",
-            rec_id, call_id, result["segment_count"],
+            "Done: id=%d call=%s segments=%d status=%s",
+            rec_id, call_id, seg_count, final_status,
         )
         return 0
 
@@ -357,6 +391,37 @@ def main() -> None:
         conn.close()
         return
 
+    # ── Build filtered VAD kwargs ──
+    vad_kwargs = {
+        "sample_rate": pre_cfg.get("target_sample_rate", 16000),
+        "window_ms": pre_cfg.get("vad_window_ms", 30),
+        "threshold": pre_cfg.get("vad_threshold", 0.5),
+        "min_segment_sec": pre_cfg.get("min_segment_sec", 1.5),
+        "max_segment_sec": pre_cfg.get("max_segment_sec", 15.0),
+        "filter_leading_sec": pre_cfg.get("filter_leading_sec", 2.0),
+        "snr_threshold": pre_cfg.get("snr_threshold", 15.0),
+        "channel_separated": False,
+        "apply_noise_reduction": True,
+        "min_segment_sec_ignore": args.min_ignore if args.min_ignore is not None else pre_cfg.get("min_segment_sec_ignore", 0.0),
+    }
+
+    # Single recording-id mode (like --call-id but by DB row id)
+    if args.recording_id:
+        from train.db import get_recording_by_id
+        row = get_recording_by_id(conn, args.recording_id)
+        if not row:
+            logger.error("未找到 recording_id=%s", args.recording_id)
+            sys.exit(1)
+        # 标记进入 processing（从 reprocessing 转换），界面显示"重新断句中"
+        update_pre_status(conn, args.recording_id, "processing")
+        diarizer_kwargs = {
+            "run_diarization": not args.no_diarize,
+            "diarizer_model_name": args.diarizer_model,
+        }
+        process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs, batch_id=args.batch_id or "v1")
+        conn.close()
+        return
+
     # Single call-id mode
     if args.call_id:
         from train.db import get_recording_by_call_id
@@ -370,22 +435,9 @@ def main() -> None:
             "diarizer_agent_threshold": args.diarizer_agent_threshold,
             "diarizer_cluster_threshold": args.diarizer_cluster_threshold,
         }
-        process_single(conn, row, cfg["preprocessed_root"], pre_cfg, diarizer_kwargs)
+        process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs, batch_id=args.batch_id or "v1")
         conn.close()
         return
-
-    # VAD kwargs
-    vad_kwargs = {
-        "sample_rate": pre_cfg.get("target_sample_rate", 16000),
-        "window_ms": pre_cfg.get("vad_window_ms", 30),
-        "threshold": pre_cfg.get("vad_threshold", 0.5),
-        "min_segment_sec": pre_cfg.get("min_segment_sec", 1.5),
-        "max_segment_sec": pre_cfg.get("max_segment_sec", 15.0),
-        "filter_leading_sec": pre_cfg.get("filter_leading_sec", 2.0),
-        "snr_threshold": pre_cfg.get("snr_threshold", 15.0),
-        "channel_separated": False,
-        "apply_noise_reduction": True,
-    }
 
     # Diarizer kwargs from CLI args
     diarizer_kwargs = {
@@ -406,7 +458,7 @@ def main() -> None:
                 continue
 
             for row in rows:
-                process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs)
+                process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs, batch_id=args.batch_id or "v1")
 
             # Phase 2: 跨录音聚合（每批处理完后触发）
             if not args.no_diarize:
@@ -442,10 +494,13 @@ def main() -> None:
     rows = claim_pending_recordings(conn, limit=args.limit or 50)
     logger.info("领取到 %d 条录音进行处理", len(rows))
 
+    batch_id = args.batch_id or "v1"
+    logger.info("本次断句版本: %s", batch_id)
+
     success = 0
     failed = 0
     for row in rows:
-        rc = process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs)
+        rc = process_single(conn, row, cfg["preprocessed_root"], vad_kwargs, diarizer_kwargs, batch_id=batch_id)
         if rc == 0:
             success += 1
         else:

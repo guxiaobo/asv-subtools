@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +54,12 @@ async def init_db(db_path: Optional[str] = None) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_recordings_file_hash "
                 "ON recordings(file_hash) WHERE file_hash IS NOT NULL"
             )
+        except Exception:
+            pass
+
+        # pre_queued_at column (方案A: pending 状态时长追踪)
+        try:
+            await conn.execute("ALTER TABLE recordings ADD COLUMN pre_queued_at TEXT")
         except Exception:
             pass
 
@@ -644,6 +651,29 @@ async def get_batches_for_recording(
         await conn.close()
 
 
+async def get_batches_with_counts(
+    recording_id: int,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """获取录音的所有断句版本信息（含片段数、是否最新），按时间降序。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT batch_id, COUNT(*) AS seg_count, "
+            "       MAX(id) AS max_id "
+            "FROM audio_segments "
+            "WHERE recording_id = ? "
+            "GROUP BY batch_id ORDER BY max_id DESC",
+            (recording_id,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        if rows:
+            rows[0]["is_latest"] = True
+        return rows
+    finally:
+        await conn.close()
+
+
 async def list_recordings_with_segments(
     agent_id: str = "",
     customer_phone: str = "",
@@ -679,6 +709,15 @@ async def list_recordings_with_segments(
         conditions.append(
             "EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
         )
+    elif status_filter == "pending":
+        # 未断句 = 尚未跑过 VAD 的录音（pending/reprocessing/processing）
+        # 不含 unsegmentable（VAD 已跑完但无语音段）
+        conditions.append(
+            "r.pre_status IN ('pending', 'reprocessing', 'processing')"
+        )
+    elif status_filter == "unsegmentable":
+        # 无法断句 = VAD 已分析但无语音段（静音/纯噪声）
+        conditions.append("r.pre_status = 'unsegmentable'")
     elif status_filter:
         conditions.append("r.pre_status = ?")
         params.append(status_filter)
@@ -734,6 +773,15 @@ async def list_recordings_with_segments_paginated(
         conditions.append(
             "EXISTS (SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id)"
         )
+    elif status_filter == "pending":
+        # 未断句 = 尚未跑过 VAD 的录音（pending/reprocessing/processing）
+        # 不含 unsegmentable（VAD 已跑完但无语音段）
+        conditions.append(
+            "r.pre_status IN ('pending', 'reprocessing', 'processing')"
+        )
+    elif status_filter == "unsegmentable":
+        # 无法断句 = VAD 已分析但无语音段（静音/纯噪声）
+        conditions.append("r.pre_status = 'unsegmentable'")
     elif status_filter:
         conditions.append("r.pre_status = ?")
         params.append(status_filter)
@@ -947,8 +995,10 @@ async def get_dashboard_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         stats: Dict[str, Any] = {}
 
         # ── 录音信息 ──
+        # 待断句 = 尚未跑过 VAD（不含 done/unsegmentable）
         cur = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'pending'"
+            "SELECT COUNT(*) AS cnt FROM recordings "
+            "WHERE pre_status NOT IN ('done', 'unsegmentable')"
         )
         stats["pending_vad"] = (await cur.fetchone())["cnt"]
 
@@ -1254,9 +1304,10 @@ async def get_segment_stats(db_path: Optional[str] = None) -> Dict[str, int]:
     try:
         stats: Dict[str, int] = {}
 
-        # 总录音数（已预处理完成）
+        # 总录音数（已预处理完成：done + unsegmentable）
         cur = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'done'"
+            "SELECT COUNT(*) AS cnt FROM recordings "
+            "WHERE pre_status IN ('done', 'unsegmentable')"
         )
         stats["total_recordings"] = (await cur.fetchone())["cnt"]
 
@@ -1266,14 +1317,18 @@ async def get_segment_stats(db_path: Optional[str] = None) -> Dict[str, int]:
         )
         stats["segmented"] = (await cur.fetchone())["cnt"]
 
-        # 未断句（已预处理但无片段）
+        # 无法断句（VAD 已分析但无语音段：静音/纯噪声）
         cur = await conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recordings r "
-            "WHERE r.pre_status = 'done' AND NOT EXISTS ("
-            "  SELECT 1 FROM audio_segments s WHERE s.recording_id = r.id"
-            ")"
+            "SELECT COUNT(*) AS cnt FROM recordings WHERE pre_status = 'unsegmentable'"
         )
-        stats["unsegmented"] = (await cur.fetchone())["cnt"]
+        stats["unsegmentable"] = (await cur.fetchone())["cnt"]
+
+        # 未断句（尚未跑过 VAD：pending/reprocessing/processing）
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM recordings "
+            "WHERE pre_status IN ('pending', 'reprocessing', 'processing')"
+        )
+        stats["pending"] = (await cur.fetchone())["cnt"]
 
         # 已打标片段
         cur = await conn.execute(
@@ -1357,5 +1412,135 @@ async def count_labeled_segments_for_speakers(
             "AND trained_status = 'untrained'"
         )
         return (await cursor.fetchone())["cnt"]
+    finally:
+        await conn.close()
+
+
+async def set_pre_statuses(recording_ids: List[int], status: str, db_path: Optional[str] = None) -> None:
+    """批量设置录音的 pre_status。
+
+    status='pending' 时同时记录 pre_queued_at（派发时间戳），用于界面区分
+    "刚派发等待中" 与 "永久卡住"。claim 成 processing / 完成 / 失败时会自动清除。
+    """
+    if not recording_ids:
+        return
+    conn = await _open_conn(db_path)
+    try:
+        placeholders = ",".join("?" for _ in recording_ids)
+        if status in ("pending", "reprocessing"):
+            # pending=首次断句派发, reprocessing=重新断句派发
+            # 都记录 pre_queued_at，界面据此显示"处理中/可能超时"
+            now = datetime.now().isoformat()
+            await conn.execute(
+                f"UPDATE recordings SET pre_status = ?, pre_queued_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [status, now, *recording_ids],
+            )
+        else:
+            await conn.execute(
+                f"UPDATE recordings SET pre_status = ? WHERE id IN ({placeholders})",
+                [status, *recording_ids],
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def get_segment_count_for_recordings(
+    recording_ids: List[int], db_path: Optional[str] = None
+) -> Dict[int, int]:
+    """获取一批录音各自的片段数。"""
+    if not recording_ids:
+        return {}
+    conn = await _open_conn(db_path)
+    try:
+        placeholders = ",".join("?" for _ in recording_ids)
+        cursor = await conn.execute_fetchall(
+            "SELECT recording_id, COUNT(*) AS cnt FROM audio_segments "
+            f"WHERE recording_id IN ({placeholders}) "
+            "GROUP BY recording_id",
+            recording_ids,
+        )
+        return {row["recording_id"]: row["cnt"] for row in cursor}
+    finally:
+        await conn.close()
+
+
+# ── 批次删除 ──
+
+
+async def is_batch_deletable(
+    recording_id: int,
+    batch_id: str,
+    db_path: Optional[str] = None,
+) -> dict:
+    """检查录音某版本是否可删除（未被活跃 checkpoint 引用）。"""
+    conn = await _open_conn(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT id FROM audio_segments "
+            "WHERE recording_id = ? AND batch_id = ?",
+            (recording_id, batch_id),
+        )
+        seg_ids = [r[0] for r in await cursor.fetchall()]
+        if not seg_ids:
+            return {"safe": True, "seg_count": 0, "reason": "empty"}
+
+        # 检查是否有活跃 checkpoint 引用了这些片段
+        placeholders = ",".join("?" for _ in seg_ids)
+        ref_cursor = await conn.execute(
+            f"""
+            SELECT DISTINCT cts.segment_id, c.id AS ck_id,
+                   c.model_name, c.version_tag
+            FROM checkpoint_training_segments cts
+            JOIN checkpoints c ON cts.checkpoint_id = c.id
+            WHERE cts.segment_id IN ({placeholders})
+            """,
+            seg_ids,
+        )
+        refs = [dict(r) for r in await ref_cursor.fetchall()]
+        if refs:
+            return {
+                "safe": False,
+                "seg_count": len(seg_ids),
+                "referenced_by": refs,
+            }
+        return {"safe": True, "seg_count": len(seg_ids)}
+    finally:
+        await conn.close()
+
+
+async def delete_batch_segments(
+    recording_id: int,
+    batch_id: str,
+    db_path: Optional[str] = None,
+) -> int:
+    """删除录音某版本的所有片段。"""
+    conn = await _open_conn(db_path)
+    try:
+        # 取 segment_ids
+        cursor = await conn.execute(
+            "SELECT id FROM audio_segments "
+            "WHERE recording_id = ? AND batch_id = ?",
+            (recording_id, batch_id),
+        )
+        seg_ids = [r[0] for r in await cursor.fetchall()]
+        if seg_ids:
+            placeholders = ",".join("?" for _ in seg_ids)
+            # 清理可能遗留的训练关联
+            await conn.execute(
+                f"DELETE FROM checkpoint_training_segments "
+                f"WHERE segment_id IN ({placeholders})",
+                seg_ids,
+            )
+        # 删除片段
+        cursor = await conn.execute(
+            "DELETE FROM audio_segments "
+            "WHERE recording_id = ? AND batch_id = ?",
+            (recording_id, batch_id),
+        )
+        deleted = cursor.rowcount
+        await conn.commit()
+        return deleted
     finally:
         await conn.close()
