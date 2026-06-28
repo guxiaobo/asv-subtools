@@ -419,62 +419,49 @@ class AudioLoader:
         hop_ms: float = 10.0,
     ) -> np.ndarray:
         """
-        Extract log-mel fbank features from audio waveform.
+        Extract log-mel fbank features from audio waveform using torchaudio Kaldi fbank.
 
-        Returns numpy array of shape (num_frames, num_filters).
-        This is a lightweight implementation using numpy FFT.
-        For production, consider using torchaudio.compliance.kaldi.fbank
-        or python_speech_features.
+        This matches the feature extraction used by CAM++/3D-Speaker training:
+        - Kaldi-style fbank (power spectrum, no energy, snip_edges)
+        - CMVN per-utterance (subtract mean, optionally divide by std)
+
+        Returns numpy array of shape (num_frames, num_filters), float32.
         """
+        import torch
+        import torchaudio
+
         sr = audio.sample_rate
-        waveform = audio.waveform
+        waveform = audio.waveform.astype(np.float32)
 
-        win_length = int(sr * window_ms / 1000.0)
-        hop_length = int(sr * hop_ms / 1000.0)
-        n_fft = 1
-        while n_fft < win_length:
-            n_fft <<= 1
+        # Kaldi fbank parameters
+        frame_length = window_ms  # in ms, Kaldi uses ms
+        frame_shift = hop_ms  # in ms
 
-        # Pre-emphasis
-        emphasized = np.append(waveform[0], waveform[1:] - 0.97 * waveform[:-1])
+        # Convert to torch tensor: shape (1, T)
+        wav_tensor = torch.from_numpy(waveform).unsqueeze(0)
 
-        # Framing
-        num_frames = 1 + (len(emphasized) - win_length) // hop_length
-        if num_frames < 1:
-            # Pad if too short
-            pad_len = win_length - len(emphasized)
-            emphasized = np.pad(emphasized, (0, max(0, pad_len)))
-            num_frames = 1
+        # Apply CMVN first (subtract mean) to waveform — Kaldi style
+        wav_tensor = wav_tensor - wav_tensor.mean()
 
-        frames = np.lib.stride_tricks.sliding_window_view(
-            emphasized, win_length
-        )[::hop_length]
-        if frames.ndim == 1:
-            frames = frames[np.newaxis, :]
+        # Compute Kaldi fbank
+        # CAM++ uses: num_mel_bins=80, frame_length=25ms, frame_shift=10ms,
+        # use_energy=False, snip_edges=True, dither=0
+        fbank = torchaudio.compliance.kaldi.fbank(
+            wav_tensor,
+            sample_frequency=sr,
+            frame_length=frame_length,
+            frame_shift=frame_shift,
+            num_mel_bins=num_filters,
+            use_energy=False,
+            snip_edges=True,
+            dither=0.0,
+        )  # shape: (num_frames, num_filters)
 
-        # Window (Hamming)
-        window = np.hamming(win_length)
-        frames = frames * window
+        # CMVN: subtract mean per mel-bin (per utterance cepstral mean normalization)
+        # Do NOT divide by std for CAM++ (Kaldi-style CMVN is mean-only)
+        fbank = fbank - fbank.mean(dim=0, keepdim=True)
 
-        # FFT -> power spectrum
-        magnitude = np.abs(np.fft.rfft(frames, n=n_fft)) ** 2
-
-        # Mel filterbank
-        mel_w = self._mel_filterbank(
-            num_filters, n_fft, sr, f_min=0, f_max=sr / 2
-        )
-        mel_energy = magnitude @ mel_w
-
-        # Log
-        mel_energy = np.maximum(mel_energy, 1e-10)
-        log_mel = np.log(mel_energy)
-
-        # Mean-variance normalization (per utterance cepstral mean)
-        log_mel = (log_mel - np.mean(log_mel, axis=1, keepdims=True)) / (
-            np.std(log_mel, axis=1, keepdims=True) + 1e-10
-        )
-
-        return log_mel.astype(np.float32)
+        return fbank.numpy().astype(np.float32)
 
     # ------------------------------------------------------------------
     # Decoders

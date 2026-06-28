@@ -751,6 +751,17 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
             <td>{seg.get('start_sec',''):.1f}s</td>
             <td>{seg.get('end_sec',''):.1f}s</td>
             <td>{seg.get('duration_sec',''):.1f}s</td>
+            <td>{recording.get('agent_id','')}</td>
+            <td>{recording.get('customer_id','')}</td>
+            <td>
+                <select class="type-select" onchange="setSpeakerType({seg['id']}, this.value)"
+                        style="padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px">
+                    <option value="agent" {"selected" if speaker_type=='agent' else ""}>坐席</option>
+                    <option value="customer" {"selected" if speaker_type=='customer' else ""}>客户</option>
+                    <option value="unknown" {"selected" if speaker_type in (None,'','unknown') else ""}>未知</option>
+                    <option value="ignored" {"selected" if speaker_type=='ignored' else ""}>已忽略</option>
+                </select>
+            </td>
             <td>
                 <button class="btn-sm" style="background:#2c3e50" onclick="playAudio('{seg['id']}')">▶ 播放</button>
             </td>
@@ -769,7 +780,7 @@ def _render_recording_detail(user, recording, segments, batches, current_batch, 
         </tr>"""
 
     if not segments:
-        seg_rows = "<tr><td colspan='8' style='text-align:center;color:#999;padding:30px'>暂无断句片段，请先执行 VAD 断句</td></tr>"
+        seg_rows = "<tr><td colspan='11' style='text-align:center;color:#999;padding:30px'>暂无断句片段，请先执行 VAD 断句</td></tr>"
 
     # Batch selector — batches is list of dicts from get_batches_with_counts
     batch_opts = ""
@@ -862,7 +873,7 @@ audio {{ width:100%; margin-top:8px }}
         </div>
         <table>
             <thead>
-                <tr><th>序号</th><th>起始</th><th>结束</th><th>时长</th><th>播放</th><th>说话人</th><th>忽略</th><th>设置标签</th></tr>
+                <tr><th>序号</th><th>起始</th><th>结束</th><th>时长</th><th>坐席</th><th>客户</th><th>类型</th><th>播放</th><th>说话人</th><th>忽略</th><th>设置标签</th></tr>
             </thead>
             <tbody>{seg_rows}</tbody>
         </table>
@@ -873,13 +884,9 @@ const audioPlayer = document.getElementById('audioPlayer');
 const player = document.getElementById('player');
 
 function playAudio(segId) {{
-    fetch('/model-manager/segments/' + segId + '/stream')
-        .then(r => r.blob())
-        .then(blob => {{
-            audioPlayer.style.display = 'block';
-            player.src = URL.createObjectURL(blob);
-            player.play();
-        }});
+    document.getElementById('audioPlayer').style.display = 'block';
+    document.getElementById('player').src = '/model-manager/segments/audio/' + segId;
+    document.getElementById('player').play();
 }}
 
 async function setLabel(segId) {{
@@ -891,10 +898,10 @@ async function setLabel(segId) {{
         speakerType = 'ignored';
     }}
     try {{
-        const resp = await fetch('/model-manager/set-label', {{
+        const resp = await fetch('/model-manager/segments/' + segId + '/label', {{
             method:'POST',
             headers:{{'Content-Type':'application/json'}},
-            body:JSON.stringify({{segment_id: segId, speaker_label: label, speaker_type: speakerType}})
+            body:JSON.stringify({{speaker_label: label, speaker_type: speakerType, label_source: 'manual', update_trained_status: true}})
         }});
         const result = await resp.json();
         if (result.success) location.reload();
@@ -943,6 +950,18 @@ async function deleteBatch() {{
         else alert('删除失败: ' + (result.error || ''));
         if (btn) {{ btn.disabled = false; btn.textContent = '🗑 删除此版本'; }}
     }} catch(e) {{ alert('网络错误: ' + e.message); if (btn) {{ btn.disabled = false; btn.textContent = '🗑 删除此版本'; }} }}
+}}
+
+async function setSpeakerType(segId, speakerType) {{
+    try {{
+        const resp = await fetch('/model-manager/segments/' + segId + '/label', {{
+            method:'POST',
+            headers:{{'Content-Type':'application/json'}},
+            body:JSON.stringify({{speaker_type: speakerType, label_source: 'manual'}})
+        }});
+        const result = await resp.json();
+        if (!result.success) alert('设置失败: ' + (result.error || ''));
+    }} catch(e) {{ alert('网络错误: ' + e.message); }}
 }}
 </script>
 </body>
@@ -1054,7 +1073,7 @@ async def label_segment(seg_id: int, request: Request):
             label_source=label_source,
         )
 
-        # If user changed the label, reset trained_status
+        # If user changed the label, reset trained_status (column may not exist)
         if update_trained:
             conn = await db._open_conn()
             try:
@@ -1063,6 +1082,8 @@ async def label_segment(seg_id: int, request: Request):
                     (seg_id,),
                 )
                 await conn.commit()
+            except Exception:
+                pass  # trained_status column may not exist
             finally:
                 await conn.close()
 
@@ -1078,11 +1099,278 @@ async def label_segment(seg_id: int, request: Request):
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ── 自动打标任务状态 + 结果查询 ──
+
+
+@router.get("/model-manager/auto-label/tasks")
+async def list_auto_label_tasks(request: Request):
+    """返回最近的自动打标任务列表。"""
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        cur = await conn.execute(
+            "SELECT id, status, progress, total_segments, processed, "
+            "model_name, checkpoint_id, threshold, "
+            "started_at, completed_at, error, created_at "
+            "FROM auto_label_tasks ORDER BY id DESC LIMIT 20"
+        )
+        tasks = [dict(r) for r in await cur.fetchall()]
+        return {"success": True, "tasks": tasks}
+    finally:
+        await conn.close()
+
+
+@router.get("/model-manager/auto-label/tasks/{task_id}")
+async def get_auto_label_task(task_id: int, request: Request):
+    """返回单个任务的状态。"""
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        cur = await conn.execute(
+            "SELECT id, status, progress, total_segments, processed, "
+            "model_name, checkpoint_id, threshold, "
+            "started_at, completed_at, error, created_at "
+            "FROM auto_label_tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"success": False, "error": "任务不存在"}
+        result = dict(row)
+        # Include preview result count
+        cur2 = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM auto_label_preview "
+            "WHERE checkpoint_id = ? OR ? = 0",
+            (result.get("checkpoint_id", 0), result.get("checkpoint_id", 0)),
+        )
+        result["result_count"] = (await cur2.fetchone())["cnt"]
+        # Include distinct model count for multi-model tasks
+        cur3 = await conn.execute(
+            "SELECT COUNT(DISTINCT model_checkpoint_id) AS mc FROM auto_label_details"
+        )
+        result["model_count"] = (await cur3.fetchone())["mc"]
+        return {"success": True, "task": result}
+    finally:
+        await conn.close()
+
+
+@router.get("/model-manager/label/segments")
+async def label_segments_paginated(
+    request: Request,
+    mode: str = "unlabeled",  # "unlabeled" or "labeled"
+    page: int = 1,
+    per_page: int = 10,
+):
+    """分页返回已打标或未打标的声纹片段。"""
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        if mode == "labeled":
+            where = "(a.speaker_label IS NOT NULL AND a.speaker_label != '' AND (a.is_ignored IS NULL OR a.is_ignored=0))"
+        else:
+            where = "((a.speaker_label IS NULL OR a.speaker_label = '') AND (a.is_ignored IS NULL OR a.is_ignored=0))"
+
+        # Count
+        cur = await conn.execute(f"SELECT COUNT(*) AS cnt FROM audio_segments a WHERE {where}")
+        total = (await cur.fetchone())["cnt"]
+
+        offset = (page - 1) * per_page
+        cur = await conn.execute(
+            f"""SELECT a.id, a.recording_id, a.segment_index, a.duration_sec,
+                       a.speaker_label, a.speaker_type, a.label_source, a.start_sec, a.end_sec,
+                       r.agent_id, r.customer_id, r.call_id, r.call_timestamp
+                FROM audio_segments a
+                LEFT JOIN recordings r ON a.recording_id = r.id
+                WHERE {where}
+                ORDER BY a.id LIMIT ? OFFSET ?""",
+            (per_page, offset),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        return {
+            "success": True,
+            "results": rows,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": max(1, (total + per_page - 1) // per_page),
+        }
+    finally:
+        await conn.close()
+
+
+@router.delete("/model-manager/auto-label/tasks/{task_id}")
+async def delete_auto_label_task(task_id: int, request: Request):
+    """删除指定自动打标任务及其所有 preview/details 数据。"""
+    await require_role(ROLE_MODEL_MANAGER)(request)
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        # Check task exists
+        cur = await conn.execute("SELECT id FROM auto_label_tasks WHERE id=?", (task_id,))
+        if not await cur.fetchone():
+            return {"success": False, "error": "任务不存在"}
+        # Delete details
+        cur2 = await conn.execute("DELETE FROM auto_label_details WHERE task_id=?", (task_id,))
+        details_deleted = cur2.rowcount
+        # Delete preview (only segments belonging to this task's details)
+        # Since preview has no task_id column, delete preview rows whose segment_id
+        # exists in details for this task
+        await conn.execute(
+            "DELETE FROM auto_label_preview WHERE segment_id IN "
+            "(SELECT DISTINCT segment_id FROM auto_label_details WHERE task_id=?)",
+            (task_id,),
+        )
+        # If no details (e.g. task failed early), delete all preview (it's stale)
+        if details_deleted == 0:
+            await conn.execute("DELETE FROM auto_label_preview")
+        # Delete task
+        await conn.execute("DELETE FROM auto_label_tasks WHERE id=?", (task_id,))
+        await conn.commit()
+        return {"success": True, "details_deleted": details_deleted}
+    finally:
+        await conn.close()
+
+
+@router.get("/model-manager/auto-label/results")
+async def get_auto_label_results(
+    request: Request,
+    task_id: int = 0,
+    page: int = 1,
+    per_page: int = 50,
+    detail: int = 0,
+):
+    """返回自动打标结果（分页）。detail=1 返回 auto_label_details."""
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        table = "auto_label_details" if detail else "auto_label_preview"
+        cp_col = "model_checkpoint_id" if detail else "checkpoint_id"
+        join_sql = "LEFT JOIN audio_segments a ON p.segment_id = a.id" if not detail else ""
+        # Count
+        cur = await conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM {table} p {join_sql} "
+            f"WHERE (? = 0 OR p.{cp_col} = ?)",
+            (task_id, task_id),
+        )
+        total = (await cur.fetchone())["cnt"]
+        # Data
+        if detail:
+            cur = await conn.execute(
+                "SELECT d.* FROM auto_label_details d "
+                "WHERE (? = 0 OR d.model_checkpoint_id = ?) "
+                "ORDER BY d.group_id, d.segment_id LIMIT ? OFFSET ?",
+                (task_id, task_id, per_page, (page - 1) * per_page),
+            )
+        else:
+            cur = await conn.execute(
+                "SELECT p.*, a.recording_id, a.duration_sec "
+                "FROM auto_label_preview p "
+                "LEFT JOIN audio_segments a ON p.segment_id = a.id "
+                "WHERE (? = 0 OR p.checkpoint_id = ?) "
+                "ORDER BY p.score DESC LIMIT ? OFFSET ?",
+                (task_id, task_id, per_page, (page - 1) * per_page),
+            )
+        rows = [dict(r) for r in await cur.fetchall()]
+        return {
+            "success": True,
+            "results": rows,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": max(1, (total + per_page - 1) // per_page),
+        }
+    finally:
+        await conn.close()
+
+
+@router.get("/model-manager/auto-label/segment-detail/{seg_id}")
+async def get_auto_label_segment_detail(seg_id: int, request: Request):
+    """返回单个片段的自动打标详情：对比组、多模型结果、两两分数。"""
+    db = _recordings_db()
+    conn = await db._open_conn()
+    try:
+        # 1. Get the segment's comparison group from auto_label_details
+        cur = await conn.execute(
+            "SELECT group_id, group_segs, model_checkpoint_id, group_scores, "
+            "cluster_result, speaker_label, speaker_type, score, reason, task_id "
+            "FROM auto_label_details WHERE segment_id = ? LIMIT 1",
+            (seg_id,),
+        )
+        detail_row = await cur.fetchone()
+        if not detail_row:
+            return {"success": False, "error": "无自动打标数据"}
+
+        dr = dict(detail_row)
+        group_id = dr["group_id"]
+        group_seg_ids = dr["group_segs"].split(":") if dr["group_segs"] else []
+
+        # 2. Get recording info for all segments in the group
+        group_segments = []
+        if group_seg_ids:
+            placeholders = ",".join("?" for _ in group_seg_ids)
+            cur = await conn.execute(
+                f"SELECT a.id AS sid, a.recording_id, a.duration_sec, a.speaker_label, "
+                f"a.speaker_type, r.agent_id, r.customer_id, r.call_id, a.file_path "
+                f"FROM audio_segments a JOIN recordings r ON a.recording_id = r.id "
+                f"WHERE a.id IN ({placeholders})",
+                [int(x) for x in group_seg_ids],
+            )
+            group_segments = [dict(r) for r in await cur.fetchall()]
+
+        # 3. Get multi-model results for this segment (deduplicated by checkpoint)
+        cur = await conn.execute(
+            "SELECT d.model_checkpoint_id, c.model_name, c.version_tag, "
+            "d.speaker_label, d.speaker_type, d.score, d.reason, d.group_scores, d.cluster_result "
+            "FROM auto_label_details d "
+            "LEFT JOIN checkpoints c ON d.model_checkpoint_id = c.id "
+            "WHERE d.segment_id = ? "
+            "GROUP BY d.model_checkpoint_id ORDER BY d.model_checkpoint_id",
+            (seg_id,),
+        )
+        model_results = [dict(r) for r in await cur.fetchall()]
+
+        # 4. Parse per-model scores and clusters
+        per_model_data = {}
+        for mr in model_results:
+            cp_id = mr["model_checkpoint_id"]
+            scores = {}
+            if mr["group_scores"]:
+                for pair in mr["group_scores"].split(";"):
+                    parts = pair.split(":")
+                    if len(parts) == 3:
+                        scores[f"{parts[0]}:{parts[1]}"] = float(parts[2])
+            per_model_data[str(cp_id)] = {
+                "scores": scores,
+                "cluster_result": mr["cluster_result"] or "",
+            }
+
+        return {
+            "success": True,
+            "detail": {
+                "group_id": group_id,
+                "group_segments": group_segments,
+                "per_model_data": per_model_data,
+                "model_results": model_results,
+                "recommended_label": dr["speaker_label"],
+                "recommended_type": dr["speaker_type"],
+                "recommended_score": dr["score"],
+                "reason": dr["reason"],
+            },
+        }
+    finally:
+        await conn.close()
+
+
 # ---------------------------------------------------------------------------
 # l14: 说话人打标页面
 @router.get("/model-manager/label", response_class=HTMLResponse)
 async def label_speakers_page(
     request: Request,
+    agent_id: str = "",
+    customer_id: str = "",
+    date_from: str = "",
+    date_to: str = "",
     speaker_type: str = "",
     label_status: str = "",
     segment_limit: int = 200,
@@ -1096,6 +1384,10 @@ async def label_speakers_page(
     recordings = []
     try:
         recordings = await db.list_recordings_with_segments(
+            agent_id=agent_id,
+            customer_id=customer_id,
+            date_from=date_from,
+            date_to=date_to,
             status_filter="done" if not label_status else label_status,
             limit=segment_limit,
         )
@@ -1188,17 +1480,22 @@ async def label_speakers_page(
         })
 
     # cp_opts 仅渲染当前选中模型的版本（初始 HTML）
-    best_cp_id = None
+    auto_selected_cp = None
     for cp in checkpoints:
         if effective_model and cp.get("model_name") != effective_model:
             continue
         vt = cp.get("version_tag", "") or f"v{cp.get('id','')}"
-        sel = 'selected' if str(cp.get("id","")) == checkpoint_id else ''
+        # Auto-select first checkpoint initially, then override with recommended
+        if not checkpoint_id and auto_selected_cp is None:
+            auto_selected_cp = cp["id"]
         is_recommended = cp.get("status") == "incremental"
+        if is_recommended:
+            auto_selected_cp = cp["id"]
+        sel = 'selected' if (str(cp.get("id","")) == checkpoint_id) else ''
+        if not checkpoint_id and cp["id"] == auto_selected_cp:
+            sel = 'selected'
         rec_label = " ★推荐" if is_recommended else ""
         cp_opts += f'<option value="{cp["id"]}" data-model="{cp.get("model_name","")}" {sel}>{cp["id"]} - {cp.get("model_name","")} ({vt}){rec_label}</option>'
-        if is_recommended and best_cp_id is None:
-            best_cp_id = cp["id"]
 
     # Build recommendation banner
     recommendation_html = ""
@@ -1233,6 +1530,7 @@ async def label_speakers_page(
             seg.get("speaker_type", ""), "#95a5a6"
         )
         lbl = seg.get("speaker_label") or "—"
+        cur_label = seg.get("speaker_label") or ""
         sid = seg["id"]
         is_ignored = seg.get("is_ignored", 0)
         ts_label = seg.get("trained_status", "")
@@ -1250,13 +1548,24 @@ async def label_speakers_page(
             "<tr>"
             f'<td>{rec.get("id","")}</td>'
             f'<td>{rec.get("agent_id","")}</td>'
+            f'<td>{rec.get("customer_id","")}</td>'
+            f'<td>{rec.get("call_timestamp","")[:16]}</td>'
             f'<td>{seg.get("segment_index","")}</td>'
             f'<td>{seg.get("duration_sec",0):.1f}s</td>'
-            f'<td><span class="badge" style="background:{color};color:#fff">{seg.get("speaker_type","")}</span></td>'
+            # 类型列：可编辑下拉框
+            f'<td>'
+            f'<select class="type-select" onchange="setSpeakerType({sid}, this.value)" '
+            f'style="padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px">'
+            f'<option value="agent" {"selected" if seg.get("speaker_type")=="agent" else ""}>坐席</option>'
+            f'<option value="customer" {"selected" if seg.get("speaker_type")=="customer" else ""}>客户</option>'
+            f'<option value="unknown" {"selected" if seg.get("speaker_type") in (None,"","unknown") else ""}>未知</option>'
+            f'<option value="ignored" {"selected" if seg.get("speaker_type")=="ignored" else ""}>已忽略</option>'
+            f'</select>'
+            f'</td>'
             f'<td><span id="lbl-{sid}">{lbl}</span>{ts_badge}</td>'
             f'<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio({sid})">▶</button></td>'
             '<td>'
-            f'<input type="text" id="sel-{sid}" class="label-search" list="dl-{sid}" placeholder="搜索或输入说话人ID" value="{sid}">'
+            f'<input type="text" id="sel-{sid}" class="label-search" list="dl-{sid}" placeholder="搜索或输入说话人ID" value="{cur_label}">'
             f'<datalist id="dl-{sid}">{dl_opts}</datalist>'
             f'<button class="btn-sm" style="background:#8e44ad" onclick="setLabel({sid})">✓</button>'
             "</td>"
@@ -1295,7 +1604,11 @@ td{{padding:6px 8px;font-size:13px;border-bottom:1px solid #eee}}
 .badge{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px}}
 .btn{{padding:7px 16px;border:none;border-radius:5px;cursor:pointer;font-size:13px}}
 .btn-primary{{background:#3498db;color:#fff}}
+.btn-primary:hover{{background:#2980b9}}
 .btn-sm{{padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;color:#fff}}
+.filter-row{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;align-items:end}}
+.filter-row select,.filter-row input{{padding:5px 8px;border:1px solid #ddd;border-radius:4px;font-size:12px}}
+.filter-row label{{font-size:12px;color:#555}}
 .label-select{{padding:3px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px;max-width:100px}}
 .label-search{{width:100px;padding:3px 6px;border:1px solid #ddd;border-radius:3px;font-size:11px}}
 #audioPlayer{{display:none;margin-bottom:12px}}
@@ -1308,8 +1621,23 @@ audio{{width:100%}}
 .preview-result{{font-size:12px;color:#555;margin-bottom:4px}}
 .preview-accept{{margin:4px 0}}
 .preview-accept label{{font-size:12px;margin-left:4px}}
+/* Tab layout */
+.tab-bar{{display:flex;border-bottom:2px solid #dee2e6;margin-bottom:16px}}
+.tab-bar label{{padding:10px 24px;cursor:pointer;font-size:14px;color:#666;border-bottom:3px solid transparent;margin-bottom:-2px}}
+.tab-bar label:hover{{color:#333}}
+#tab1:checked~.tab-bar label[for=tab1],
+#tab2:checked~.tab-bar label[for=tab2],
+#tab3:checked~.tab-bar label[for=tab3]{{color:#3498db;border-bottom-color:#3498db;font-weight:bold}}
+.tab-pane{{display:none}}
+#tab1:checked~.tab-pane.tab-auto,
+#tab2:checked~.tab-pane.tab-manual,
+#tab3:checked~.tab-pane.tab-labeled{{display:block}}
+.task-status{{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px}}
+.results-table{{width:100%;border-collapse:collapse;margin-top:12px}}
+.results-table th{{background:#f8f9fa;padding:6px;font-size:12px;text-align:left;border-bottom:2px solid #dee2e6}}
+.results-table td{{padding:5px 6px;font-size:12px;border-bottom:1px solid #eee}}
 </style></head>
-<body>
+<body onload="loadLabeledPage(1)">
 <div class="nav">
     <strong>声纹管理系统</strong>
     <a href="/model-manager">← 首页</a>
@@ -1325,52 +1653,67 @@ audio{{width:100%}}
         <div class="summary-item"><div class="summary-num" style="color:#e67e22">{unlabeled_count}</div><div class="summary-label">待打标片段</div></div>
     </div>
 
-    <!-- 系统自动打标面板 -->
-    <div class="card">
-        <h2>系统自动打标</h2>
-        {recommendation_html}
-        <div class="filter-bar">
-            <label>模型：</label>
-            <select id="autoModel" onchange="onModelChange()">
-                {model_opts}
-            </select>
-            <label>版本：</label>
-            <select id="autoCheckpoint">{cp_opts}</select>
-            <label style="margin-left:12px">阈值：</label>
-            <input type="number" id="autoThreshold" value="0.35" min="0.1" max="0.9" step="0.05" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px">
-            <label>最少片段：</label>
-            <input type="number" id="autoMinSeg" value="2" min="1" max="10" step="1" style="width:50px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px">
-            <button class="btn btn-primary" onclick="previewAutoLabel()">🔍 预览自动打标</button>
-            <button class="btn" style="background:#27ae60;color:#fff" onclick="confirmAutoLabel()" id="btnConfirmAuto" disabled>💾 全部确认保存</button>
+    <!-- Tab: 已打标说话人 / 系统自动打标 / 手工打标 -->
+    <input type="radio" name="labelTab" id="tab3" hidden checked>
+    <input type="radio" name="labelTab" id="tab1" hidden>
+    <input type="radio" name="labelTab" id="tab2" hidden>
+    <div class="tab-bar">
+        <label for="tab3" onclick="loadLabeledPage(1)">✅ 已打标说话人</label>
+        <label for="tab1">🤖 系统自动打标</label>
+        <label for="tab2" onclick="loadManualPage(1)">✏️ 手工打标</label>
+    </div>
+
+    <!-- ── 自动打标 Tab ── -->
+    <div class="tab-pane tab-auto">
+        <div class="card">
+            <h2>启动自动打标</h2>
+            {recommendation_html}
+            <div class="filter-bar">
+                <label>模型：</label>
+                <select id="autoModel" onchange="onModelChange()">
+                    {model_opts}
+                </select>
+                <label>版本：</label>
+                <select id="autoCheckpoint">{cp_opts}</select>
+                <label>阈值：</label>
+                <input type="number" id="autoThreshold" value="0.35" min="0.1" max="0.9" step="0.05" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px">
+                <label style="margin-left:8px">
+                    <input type="checkbox" id="useAllModels"> 使用所有模型
+                </label>
+                <button class="btn btn-primary" onclick="startAutoLabel()">🚀 开始自动打标</button>
+                <button class="btn" style="background:#6c757d;color:#fff;margin-left:8px" onclick="showTaskHistory()">📋 历史任务</button>
+            </div>
+            <div id="taskStatus" class="task-status" style="display:none"></div>
         </div>
-        <div id="autoPreview" class="auto-preview">
-            <h3>自动打标预览</h3>
-            <div id="autoPreviewText">执行预览后显示各片段识别结果...</div>
+
+        <div class="card">
+            <h2>打标结果</h2>
+            <div id="resultsArea">
+                <div style="text-align:center;color:#999;padding:20px">请先启动自动打标任务</div>
+            </div>
         </div>
     </div>
 
-    <div class="card">
-        <h2>手动打标</h2>
-        <div class="filter-bar">
-            <label>类型：</label>
-            <select onchange="location.href='/model-manager/label?speaker_type='+this.value+'&label_status={label_status}&model_name={model_name}&checkpoint_id={checkpoint_id}'">
-                <option value="">全部</option>
-                <option value="agent" {'selected' if speaker_type=='agent' else ''}>坐席</option>
-                <option value="customer" {'selected' if speaker_type=='customer' else ''}>客户</option>
-                <option value="unknown" {'selected' if speaker_type=='unknown' else ''}>未知</option>
-            </select>
-            <label>状态：</label>
-            <select onchange="location.href='/model-manager/label?label_status='+this.value+'&speaker_type={speaker_type}&model_name={model_name}&checkpoint_id={checkpoint_id}'">
-                <option value="">全部（已断句）</option>
-                <option value="all" {'selected' if label_status=='all' else ''}>全部</option>
-            </select>
-            <span style="font-size:11px;color:#999">选择片段 → 选说话人 → 点 ✓ 确认</span>
+    <!-- ── 手工打标 Tab ── -->
+    <div class="tab-pane tab-manual">
+        <div class="card">
+            <h2>手工打标</h2>
+            <span style="font-size:11px;color:#999;display:block;margin-bottom:8px">选择片段 → 输入或选说话人ID → 点 ✓ 确认</span>
+            <div id="audioPlayer"><audio id="player" controls></audio></div>
+            <div id="manualArea">
+                <div style="text-align:center;color:#999;padding:20px">点击"手工打标"标签加载未打标片段</div>
+            </div>
         </div>
-        <div id="audioPlayer"><audio id="player" controls></audio></div>
-        <table>
-            <thead><tr><th>录音ID</th><th>坐席</th><th>片段</th><th>时长</th><th>类型</th><th>标签</th><th>播放</th><th>手动标记</th><th>自动结果</th></tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
+    </div>
+
+    <!-- ── 已打标说话人 Tab ── -->
+    <div class="tab-pane tab-labeled">
+        <div class="card">
+            <h2>已打标说话人</h2>
+            <div id="labeledArea">
+                <div style="text-align:center;color:#999;padding:20px">点击上方"已打标说话人"标签加载</div>
+            </div>
+        </div>
     </div>
 </div>
 <script>
@@ -1381,6 +1724,91 @@ function playAudio(segId) {{
     document.getElementById("audioPlayer").style.display = "block";
     document.getElementById("player").src = "/model-manager/segments/audio/" + segId;
     document.getElementById("player").play();
+}}
+
+// ── 已打标说话人分页 ──
+async function loadLabeledPage(page) {{
+    try {{
+        const resp = await fetch("/model-manager/label/segments?mode=labeled&page=" + page + "&per_page=10");
+        const r = await resp.json();
+        if (!r.success) return;
+        var area = document.getElementById("labeledArea");
+        if (r.total === 0) {{
+            area.innerHTML = '<div style="text-align:center;color:#999;padding:20px">暂无已打标片段</div>';
+            return;
+        }}
+        var html = '<div style="display:flex;align-items:center;margin-bottom:8px;gap:12px;flex-wrap:wrap;font-size:13px">';
+        html += '<span>共 <strong>' + r.total + '</strong> 条已打标片段</span>';
+        if (r.total_pages > 1) {{
+            if (page > 1) html += '<a href="javascript:loadLabeledPage(' + (page-1) + ')">← 上一页</a>';
+            html += '<span>第 ' + page + '/' + r.total_pages + ' 页</span>';
+            if (page < r.total_pages) html += '<a href="javascript:loadLabeledPage(' + (page+1) + ')">下一页 →</a>';
+        }}
+        html += '</div>';
+        html += '<table class="results-table"><thead><tr><th>片段ID</th><th>录音ID</th><th>坐席</th><th>客户</th><th>片段</th><th>时长</th><th>说话人</th><th>类型</th><th>来源</th><th>播放</th></tr></thead><tbody>';
+        for (var i = 0; i < r.results.length; i++) {{
+            var s = r.results[i];
+            var typeLabel = {{agent:"坐席", customer:"客户", unknown:"未知"}}[s.speaker_type] || s.speaker_type || "—";
+            var sourceLabel = {{auto:"自动", manual:"手动"}}[s.label_source] || s.label_source || "—";
+            html += '<tr><td>' + s.id + '</td><td>' + (s.recording_id || "") + '</td>'
+                + '<td>' + (s.agent_id || "") + '</td><td>' + (s.customer_id || "") + '</td>'
+                + '<td>' + (s.segment_index || "") + '</td>'
+                + '<td>' + (s.duration_sec || 0).toFixed(1) + 's</td>'
+                + '<td><strong>' + (s.speaker_label || "—") + '</strong></td>'
+                + '<td>' + typeLabel + '</td><td>' + sourceLabel + '</td>'
+                + '<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio(' + s.id + ')">▶</button></td></tr>';
+        }}
+        html += '</tbody></table>';
+        area.innerHTML = html;
+    }} catch(e) {{
+        document.getElementById("labeledArea").innerHTML = '<div style="color:#e74c3c">加载失败: ' + e.message + '</div>';
+    }}
+}}
+
+// ── 手工打标分页（未打标片段） ──
+async function loadManualPage(page) {{
+    try {{
+        const resp = await fetch("/model-manager/label/segments?mode=unlabeled&page=" + page + "&per_page=10");
+        const r = await resp.json();
+        if (!r.success) return;
+        var area = document.getElementById("manualArea");
+        if (r.total === 0) {{
+            area.innerHTML = '<div style="text-align:center;color:#999;padding:20px">所有片段已打标完成</div>';
+            return;
+        }}
+        var html = '<div style="display:flex;align-items:center;margin-bottom:8px;gap:12px;flex-wrap:wrap;font-size:13px">';
+        html += '<span>共 <strong>' + r.total + '</strong> 条未打标片段</span>';
+        if (r.total_pages > 1) {{
+            if (page > 1) html += '<a href="javascript:loadManualPage(' + (page-1) + ')">← 上一页</a>';
+            html += '<span>第 ' + page + '/' + r.total_pages + ' 页</span>';
+            if (page < r.total_pages) html += '<a href="javascript:loadManualPage(' + (page+1) + ')">下一页 →</a>';
+        }}
+        html += '</div>';
+        html += '<table class="results-table"><thead><tr><th>片段ID</th><th>录音ID</th><th>坐席</th><th>客户</th><th>片段</th><th>时长</th><th>类型</th><th>说话人</th><th>播放</th><th>手动标记</th></tr></thead><tbody>';
+        for (var i = 0; i < r.results.length; i++) {{
+            var s = r.results[i];
+            var sid = s.id;
+            html += '<tr><td>' + sid + '</td><td>' + (s.recording_id || "") + '</td>'
+                + '<td>' + (s.agent_id || "") + '</td><td>' + (s.customer_id || "") + '</td>'
+                + '<td>' + (s.segment_index || "") + '</td>'
+                + '<td>' + (s.duration_sec || 0).toFixed(1) + 's</td>'
+                + '<td><select class="type-select" onchange="setSpeakerType(' + sid + ', this.value)" style="padding:2px 4px;border:1px solid #ddd;border-radius:3px;font-size:11px">'
+                + '<option value="agent"' + (s.speaker_type=="agent" ? " selected" : "") + '>坐席</option>'
+                + '<option value="customer"' + (s.speaker_type=="customer" ? " selected" : "") + '>客户</option>'
+                + '<option value="unknown"' + (!s.speaker_type || s.speaker_type=="unknown" ? " selected" : "") + '>未知</option>'
+                + '</select></td>'
+                + '<td><span id="lbl-' + sid + '">—</span></td>'
+                + '<td><button class="btn-sm" style="background:#2c3e50" onclick="playAudio(' + sid + ')">▶</button></td>'
+                + '<td><input type="text" id="sel-' + sid + '" class="label-search" list="dl-' + sid + '" placeholder="说话人ID">'
+                + '<datalist id="dl-' + sid + '">{dl_opts}</datalist>'
+                + '<button class="btn-sm" style="background:#8e44ad" onclick="setLabel(' + sid + ')">✓</button></td>'
+                + '</tr>';
+        }}
+        html += '</tbody></table>';
+        area.innerHTML = html;
+    }} catch(e) {{
+        document.getElementById("manualArea").innerHTML = '<div style="color:#e74c3c">加载失败: ' + e.message + '</div>';
+    }}
 }}
 
 function onModelChange() {{
@@ -1429,6 +1857,20 @@ async function setLabel(segId) {{
     }} catch(e) {{ alert("网络错误: " + e.message); }}
 }}
 
+async function setSpeakerType(segId, speakerType) {{
+    try {{
+        const resp = await fetch("/model-manager/segments/" + segId + "/label", {{
+            method: "POST", headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify({{
+                speaker_type: speakerType,
+                label_source: "manual"
+            }})
+        }});
+        const r = await resp.json();
+        if (!r.success) alert("设置失败: " + (r.error || ""));
+    }} catch(e) {{ alert("网络错误: " + e.message); }}
+}}
+
 function getCheckpointInfo(cpId) {{
     for (var i = 0; i < checkpoints.length; i++) {{
         if (String(checkpoints[i].id) === String(cpId)) return checkpoints[i];
@@ -1436,131 +1878,443 @@ function getCheckpointInfo(cpId) {{
     return null;
 }}
 
-async function previewAutoLabel() {{
-    const cpId = document.getElementById("autoCheckpoint").value;
-    if (!cpId) {{ alert("请选择模型版本"); return; }}
+// ── 自动打标：启动任务 + 轮询 + 结果展示 ──
+var currentTaskId = null;
+var latestTaskId = null;
+var isViewingHistory = false;
+var pollTimer = null;
 
-    const btn = event.target; btn.disabled = true;
-    var origText = btn.textContent; btn.textContent = "分析中...";
-
+async function startAutoLabel() {{
+    var useAll = document.getElementById("useAllModels").checked;
+    var cpId, modelName;
+    if (useAll) {{
+        cpId = 0;
+        modelName = "all";
+    }} else {{
+        cpId = document.getElementById("autoCheckpoint").value;
+        if (!cpId) {{ alert("请选择模型版本"); return; }}
+        modelName = document.getElementById("autoModel").value;
+    }}
+    if (!confirm("确定启动自动打标？" + (useAll ? "（使用所有模型的最新checkpoint）" : "") + "系统将对所有未打标片段进行声纹比对分析，请耐心等待。")) return;
+    
+    var btn = event.target; btn.disabled = true;
+    var origText = btn.textContent; btn.textContent = "启动中...";
+    
     try {{
         const resp = await fetch("/model-manager/run-label", {{
             method: "POST",
             headers:{{"Content-Type":"application/json"}},
             body: JSON.stringify({{
-                checkpoint_id: parseInt(cpId),
+                checkpoint_id: cpId,
                 preview_only: true,
-                model_name: document.getElementById("autoModel").value,
+                model_name: modelName,
                 threshold: parseFloat(document.getElementById("autoThreshold").value) || 0.35,
-                min_segments: parseInt(document.getElementById("autoMinSeg").value) || 2,
             }})
         }});
         const r = await resp.json();
-
-        if (r.error) {{
-            document.getElementById("autoPreview").style.display = "block";
-            document.getElementById("autoPreviewText").innerHTML = '<span style="color:#e74c3c">错误: ' + r.error + '</span>';
+        if (!r.success) {{
+            if (r.error) alert("启动失败: " + r.error);
+            else alert("启动失败");
             btn.disabled = false; btn.textContent = origText;
             return;
         }}
-
-        // r.results is {{segId: {{speaker_label, score, reason}}}}
-        autoResults = r.results || {{}};
-        var previewHtml = "";
-        var matchCount = 0;
-        var newSpeakerCount = 0;
-        var segIds = Object.keys(autoResults);
-        for (var si = 0; si < segIds.length; si++) {{
-            var segId = segIds[si];
-            var res = autoResults[segId];
-            if (!res) continue;
-            matchCount++;
-
-            // Group: "已匹配" vs "新说话人候选"
-            var isNewCandidate = res.speaker_label && res.speaker_label.startsWith("NEW_");
-            if (isNewCandidate) newSpeakerCount++;
-
-            // Detailed preview line
-            var icon = isNewCandidate ? "🆕" : "✅";
-            var reasonHtml = res.reason ? '<span style="color:#888;font-size:11px"> ' + res.reason + '</span>' : "";
-            previewHtml += '<div class="preview-result">';
-            previewHtml += '  ' + icon + ' 片段#' + segId + ': <strong>' + (res.speaker_label || "?") + '</strong>';
-            previewHtml += '  相似度: ' + (res.score != null ? res.score.toFixed(3) : "—");
-            previewHtml += reasonHtml;
-            previewHtml += '</div>';
-
-            // Update table cell with checkbox + label + score
-            var autoCell = document.getElementById("auto-" + segId);
-            if (autoCell) {{
-                var labelDisplay = isNewCandidate ? res.speaker_label.replace("NEW_", "🆕新:") : res.speaker_label;
-                var scoreStr = res.score != null ? res.score.toFixed(3) : "";
-                var bgColor = isNewCandidate ? "#fff3cd" : (res.score >= 0.5 ? "#d1fae5" : "#fef3c7");
-                autoCell.innerHTML = '<input type="checkbox" class="auto-accept" data-seg="' + segId + '" checked onchange="updateConfirmBtn()"> '
-                    + '<span style="background:' + bgColor + ';padding:2px 5px;border-radius:3px;font-size:11px">'
-                    + '<strong>' + labelDisplay + '</strong>'
-                    + ' <span style="color:#666">' + scoreStr + '</span>'
-                    + '</span>';
-            }}
-        }}
-
-        if (matchCount === 0) {{
-            previewHtml = '<span style="color:#888">所有片段已有标签或已被忽略，无需自动打标。</span>';
-        }}
-
-        document.getElementById("autoPreview").style.display = "block";
-        var summaryHtml = '<div style="margin-bottom:6px;font-size:13px">'
-            + '匹配 <strong>' + matchCount + '</strong> 段'
-            + (newSpeakerCount ? ', 其中 <strong>' + newSpeakerCount + '</strong> 段被推荐为新说话人' : '')
-            + '</div>';
-        document.getElementById("autoPreviewText").innerHTML = summaryHtml + previewHtml;
-        updateConfirmBtn();
+        currentTaskId = r.task_id;
+        latestTaskId = r.task_id;
+        isViewingHistory = false;
+        var statusDiv = document.getElementById("taskStatus");
+        statusDiv.style.display = "block";
+        statusDiv.innerHTML = '⏳ 自动打标任务 #' + currentTaskId + ' 已启动，正在处理...';
+        statusDiv.style.background = "#fff3cd";
+        // Start polling
+        pollTimer = setInterval(function() {{ pollTask(currentTaskId); }}, 3000);
+        btn.disabled = false; btn.textContent = origText;
     }} catch(e) {{
-        document.getElementById("autoPreview").style.display = "block";
-        document.getElementById("autoPreviewText").innerHTML = '<span style="color:#e74c3c">请求失败: ' + e.message + '</span>';
+        alert("网络错误: " + e.message);
+        btn.disabled = false; btn.textContent = origText;
     }}
-    btn.disabled = false; btn.textContent = origText;
 }}
 
-function updateConfirmBtn() {{
-    var checkboxes = document.querySelectorAll(".auto-accept:checked");
-    document.getElementById("btnConfirmAuto").disabled = (checkboxes.length === 0);
-}}
-
-async function confirmAutoLabel() {{
-    if (!confirm("确定用自动打标结果更新所有勾选的片段？")) return;
-    var checkboxes = document.querySelectorAll(".auto-accept:checked");
-    var toSave = [];
-    checkboxes.forEach(function(cb) {{
-        var segId = cb.getAttribute("data-seg");
-        var res = autoResults[segId];
-        if (res) toSave.push(segId);
-    }});
-
-    if (toSave.length === 0) {{ alert("没有勾选的片段"); return; }}
-
-    var btn = document.getElementById("btnConfirmAuto");
-    var origText = btn.textContent; btn.disabled = true; btn.textContent = "保存中...";
-
+async function pollTask(taskId) {{
     try {{
-        const resp = await fetch("/model-manager/run-label", {{
-            method: "POST",
-            headers:{{"Content-Type":"application/json"}},
-            body: JSON.stringify({{
-                confirm_segments: toSave,
-                results: autoResults,
-                model_name: document.getElementById("autoModel").value,
-                checkpoint_id: parseInt(document.getElementById("autoCheckpoint").value),
-            }})
+        const resp = await fetch("/model-manager/auto-label/tasks/" + taskId);
+        const r = await resp.json();
+        if (!r.success || !r.task) return;
+        var t = r.task;
+        var statusDiv = document.getElementById("taskStatus");
+        var html = "";
+        if (t.status === "running" || t.status === "pending") {{
+            html = '⏳ 任务 #' + taskId + ' 运行中…';
+            if (t.started_at) {{
+                html += '<br>🕐 启动时间: ' + t.started_at;
+                var elapsed = Math.floor((Date.now() - new Date(t.started_at).getTime()) / 1000);
+                var min = Math.floor(elapsed / 60);
+                var sec = elapsed % 60;
+                html += '<br>⏱ 已运行: ' + min + '分' + sec + '秒';
+            }}
+            html += '<br>📊 进度: ' + t.processed + '/' + t.total_segments + ' 段 (' + (t.total_segments ? Math.round(t.processed/t.total_segments*100) : 0) + '%)';
+            if (t.result_count > 0) html += '<br>📈 已保存中间结果: ' + t.result_count + ' 条';
+            statusDiv.style.background = "#fff3cd";
+            // Also load intermediate results while running
+            if (t.result_count > 0) loadResultsPage(taskId, 1);
+        }} else if (t.status === "completed") {{
+            html = '✅ 任务 #' + taskId + ' 完成！';
+            if (t.started_at) html += '<br>🕐 启动: ' + t.started_at;
+            if (t.completed_at) html += '<br>🏁 完成: ' + t.completed_at;
+            if (t.started_at && t.completed_at) {{
+                var elapsed = Math.floor((new Date(t.completed_at) - new Date(t.started_at)) / 1000);
+                var min = Math.floor(elapsed / 60);
+                var sec = elapsed % 60;
+                html += '<br>⏱ 总耗时: ' + min + '分' + sec + '秒';
+            }}
+            html += '<br>📊 共处理 <strong>' + t.total_segments + '</strong> 段';
+            if (t.model_count && t.model_count > 1) {{
+                html += '（' + t.model_count + '个模型 × ' + t.total_segments + ' = ' + t.processed + ' 次分析）';
+            }}
+            if (t.result_count > 0) html += '，其中 ' + t.result_count + ' 条未打标结果';
+            statusDiv.style.background = "#d4edda";
+            if (pollTimer) clearInterval(pollTimer);
+            loadResultsPage(taskId, 1);
+        }} else if (t.status === "failed") {{
+            html = '❌ 任务 #' + taskId + ' 失败: ' + (t.error || "未知错误");
+            statusDiv.style.background = "#f8d7da";
+            if (pollTimer) clearInterval(pollTimer);
+        }}
+        if (html) statusDiv.innerHTML = html;
+    }} catch(e) {{
+        // ignore polling errors
+    }}
+}}
+
+async function loadResultsPage(taskId, page) {{
+    try {{
+        const resp = await fetch("/model-manager/auto-label/results?task_id=0&page=" + page + "&per_page=50");
+        const r = await resp.json();
+        if (!r.success) return;
+        var area = document.getElementById("resultsArea");
+        if (r.total === 0) {{
+            area.innerHTML = '<div style="text-align:center;color:#999;padding:20px">无打标结果</div>';
+            return;
+        }}
+        var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">';
+        html += '<p style="margin:0">共 <strong>' + r.total + '</strong> 条结果</p>';
+        html += '<div style="font-size:13px">';
+        if (r.total_pages > 1) {{
+            if (page > 1) html += '<a href="javascript:loadResultsPage(' + taskId + ',' + (page-1) + ')" style="margin:0 8px">← 上一页</a>';
+            html += ' 第 ' + page + '/' + r.total_pages + ' 页 ';
+            if (page < r.total_pages) html += '<a href="javascript:loadResultsPage(' + taskId + ',' + (page+1) + ')" style="margin:0 8px">下一页 →</a>';
+        }}
+        html += '<button class="btn" style="background:' + (isViewingHistory ? '#ccc' : '#27ae60') + ';color:#fff;margin-left:12px"' + (isViewingHistory ? ' disabled title="历史任务结果不可确认，请运行新任务"' : '') + ' onclick="confirmAllResults(' + taskId + ')">💾 确认全部结果</button>';
+        html += '</div></div>';
+        html += '<table class="results-table"><thead><tr><th>片段ID</th><th>推荐标签</th><th>类型</th><th>相似度</th><th>说明</th><th>操作</th></tr></thead><tbody>';
+        for (var i = 0; i < r.results.length; i++) {{
+            var rs = r.results[i];
+            var typeLabel = {{agent:"坐席", customer:"客户", unknown:"未知"}}[rs.speaker_type] || rs.speaker_type;
+            html += '<tr><td>' + rs.segment_id + '</td><td><strong>' + rs.speaker_label + '</strong></td>'
+                 + '<td>' + typeLabel + '</td><td>' + (rs.score || 0).toFixed(4) + '</td>'
+                 + '<td style="color:#888;font-size:11px">' + (rs.reason || "") + '</td>'
+                 + '<td><a href="javascript:showDetail(' + rs.segment_id + ')" style="font-size:11px">📋 详情</a></td></tr>';
+        }}
+        html += '</tbody></table>';
+        area.innerHTML = html;
+    }} catch(e) {{
+        document.getElementById("resultsArea").innerHTML = '<div style="color:#e74c3c">加载结果失败: ' + e.message + '</div>';
+    }}
+}}
+
+// ── 片段详情弹窗 ──
+var selectedModelCpId = null;
+
+async function showDetail(segId) {{
+    try {{
+        const resp = await fetch("/model-manager/auto-label/segment-detail/" + segId);
+        const r = await resp.json();
+        if (!r.success) {{ alert(r.error || "加载失败"); return; }}
+        var d = r.detail;
+        selectedModelCpId = d.model_results.length > 0 ? String(d.model_results[0].model_checkpoint_id) : null;
+
+        var html = '<div id="detailModal" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999;overflow:auto">'
+            + '<div style="background:#fff;margin:30px auto;max-width:900px;border-radius:8px;padding:20px;position:relative">'
+            + '<a href="javascript:closeDetail()" style="position:absolute;top:12px;right:16px;font-size:20px;text-decoration:none;color:#999">✕</a>'
+            + '<h3>片段 #' + segId + ' 自动打标详情</h3>';
+
+        // Recommended result
+        html += '<div style="background:#ebf5fb;padding:10px 14px;border-radius:6px;margin:12px 0">'
+            + '<strong>推荐结果：</strong>' + d.recommended_label + '（' + ({{agent:"坐席", customer:"客户", unknown:"未知"}}[d.recommended_type] || d.recommended_type) + '）'
+            + ' · 相似度: ' + (d.recommended_score || 0).toFixed(4)
+            + '<br><span style="color:#666;font-size:12px">' + (d.reason || "") + '</span></div>';
+
+        // Model results + radio buttons
+        if (d.model_results && d.model_results.length > 0) {{
+            html += '<h4 style="margin:12px 0 8px">选择模型</h4><div style="margin-bottom:8px">';
+            for (var mi = 0; mi < d.model_results.length; mi++) {{
+                var mr = d.model_results[mi];
+                var cid = String(mr.model_checkpoint_id);
+                var checked = (cid === selectedModelCpId) ? 'checked' : '';
+                html += '<label style="margin-right:16px;font-size:13px;cursor:pointer">'
+                    + '<input type="radio" name="modelCp" value="' + cid + '" ' + checked + ' onchange="switchModelCp(' + cid + ',' + segId + ')"> '
+                    + (mr.model_name || "-") + ' (' + (mr.version_tag || "-") + ')'
+                    + ' → ' + mr.speaker_label + ' (' + (mr.score || 0).toFixed(4) + ')</label>';
+            }}
+            html += '</div>';
+        }}
+
+        // Comparison group + Scores + Clusters tabs (model-aware)
+        html += '<div style="margin:12px 0">';
+        html += '<input type="radio" name="detailTab" id="dt1" hidden checked>';
+        html += '<input type="radio" name="detailTab" id="dt2" hidden>';
+        html += '<input type="radio" name="detailTab" id="dt3" hidden>';
+        html += '<div class="tab-bar" style="margin-bottom:8px">'
+            + '<label for="dt1" style="padding:6px 16px;cursor:pointer;font-size:13px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px">对比组</label>'
+            + '<label for="dt2" style="padding:6px 16px;cursor:pointer;font-size:13px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px">两两相似度</label>'
+            + '<label for="dt3" style="padding:6px 16px;cursor:pointer;font-size:13px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px">说话人分组</label>'
+            + '</div>';
+
+        // Tab 1: Comparison group (static)
+        html += '<div class="tab-pane" id="tabGroup">';
+        html += '<table class="results-table"><thead><tr><th>片段ID</th><th>录音ID</th><th>坐席</th><th>客户</th><th>时长</th><th>播放</th><th>已有标签</th></tr></thead><tbody>';
+        for (var gi = 0; gi < d.group_segments.length; gi++) {{
+            var gs = d.group_segments[gi];
+            var marker = (gs.sid == segId) ? ' ★' : '';
+            html += '<tr' + (gs.sid == segId ? ' style="background:#fff3cd"' : '') + '>'
+                + '<td>' + gs.sid + marker + '</td><td>' + (gs.recording_id || "") + '</td>'
+                + '<td>' + (gs.agent_id || "") + '</td><td>' + (gs.customer_id || "") + '</td>'
+                + '<td>' + (gs.duration_sec || 0).toFixed(1) + 's</td>'
+                + '<td><a href="javascript:playDetailAudio(' + gs.sid + ')" style="font-size:11px">▶</a></td>'
+                + '<td>' + (gs.speaker_label || "—") + '</td></tr>';
+        }}
+        html += '</tbody></table></div>';
+
+        // Tab 2: Scores (model-aware, updated via renderDetailScores)
+        html += '<div class="tab-pane" id="tabScores">加载中...</div>';
+
+        // Tab 3: Clusters (model-aware, updated via renderDetailClusters)
+        html += '<div class="tab-pane" id="tabClusters">加载中...</div>';
+        html += '</div>';
+        // Tab switching CSS (inline)
+        html += '<style>'
+            + '.tab-pane {{ display:none }}'
+            + '#dt1:checked ~ .tab-bar label[for=dt1], #dt2:checked ~ .tab-bar label[for=dt2], #dt3:checked ~ .tab-bar label[for=dt3] {{ color:#3498db; border-bottom-color:#3498db; font-weight:bold }}'
+            + '#dt1:checked ~ #tabGroup, #dt2:checked ~ #tabScores, #dt3:checked ~ #tabClusters {{ display:block }}'
+            + '</style>';
+
+        html += '</div></div>';
+        var div = document.createElement("div");
+        div.innerHTML = html;
+        document.body.appendChild(div.firstElementChild);
+
+        // Load initial scores
+        if (selectedModelCpId) renderDetailScores(segId, d);
+    }} catch(e) {{
+        alert("加载详情失败: " + e.message);
+    }}
+}}
+
+function switchModelCp(cpId, segId) {{
+    selectedModelCpId = cpId;
+    // Re-fetch to get the data for this model
+    fetch("/model-manager/auto-label/segment-detail/" + segId)
+        .then(r => r.json())
+        .then(r => {{
+            if (r.success) renderDetailScores(segId, r.detail);
         }});
+}}
+
+function renderDetailScores(segId, d) {{
+    var pm = d.per_model_data || {{}};
+    var data = pm[selectedModelCpId];
+    var html = "";
+    if (!data) {{
+        document.getElementById("tabScores").innerHTML = '<div style="color:#999">无该模型数据</div>';
+        return;
+    }}
+    var scores = data.scores || {{}};
+    var scoreKeys = Object.keys(scores);
+
+    if (scoreKeys.length > 0) {{
+        html += '<table class="results-table"><thead><tr><th>片段A</th><th>播放</th><th>片段B</th><th>播放</th><th>相似度</th></tr></thead><tbody>';
+        for (var si = 0; si < scoreKeys.length; si++) {{
+            var sk = scoreKeys[si];
+            var parts = sk.split(":");
+            var scoreVal = scores[sk];
+            var highlight = (parts[0] == segId || parts[1] == segId) ? ' style="background:#fef3c7"' : '';
+            html += '<tr' + highlight + '><td>' + parts[0] + '</td>'
+                + '<td><a href="javascript:playDetailAudio(' + parts[0] + ')" style="font-size:11px">▶</a></td>'
+                + '<td>' + parts[1] + '</td>'
+                + '<td><a href="javascript:playDetailAudio(' + parts[1] + ')" style="font-size:11px">▶</a></td>'
+                + '<td>' + scoreVal.toFixed(4) + '</td></tr>';
+        }}
+        html += '</tbody></table>';
+    }} else {{
+        html = '<div style="color:#999">无相似度数据</div>';
+    }}
+    document.getElementById("tabScores").innerHTML = html;
+
+    // Also update clusters tab
+    renderDetailClusters(data);
+}}
+
+function renderDetailClusters(data) {{
+    var html = "";
+    if (data.cluster_result) {{
+        var groups = data.cluster_result.split(";");
+        html += '<div style="font-size:13px;line-height:2">';
+        for (var gi = 0; gi < groups.length; gi++) {{
+            var members = groups[gi].split(":");
+            html += '<div style="margin:6px 0;padding:6px 10px;background:#f8f9fa;border-radius:4px">'
+                + '<strong>说话人组 ' + (gi+1) + '</strong>: ';
+            for (var mi = 0; mi < members.length; mi++) {{
+                html += '<span style="display:inline-block;padding:2px 6px;background:#eaf2f8;border-radius:3px;margin:2px">'
+                    + '<a href="javascript:playDetailAudio(' + members[mi] + ')" style="text-decoration:none;color:#333">'
+                    + members[mi] + ' ▶</a></span> ';
+            }}
+            html += '</div>';
+        }}
+        html += '<div style="font-size:12px;color:#888;margin-top:8px">同一颜色组内的片段被推断为同一说话人</div>';
+        html += '</div>';
+    }} else {{
+        html = '<div style="color:#999">无分组数据</div>';
+    }}
+    document.getElementById("tabClusters").innerHTML = html;
+}}
+
+function playDetailAudio(segId) {{
+    var player = document.getElementById("detailAudioPlayer");
+    if (!player) {{
+        player = document.createElement("audio");
+        player.id = "detailAudioPlayer";
+        player.controls = true;
+        player.style.cssText = "width:100%;margin:8px 0";
+        document.getElementById("detailModal").querySelector("div").appendChild(player);
+    }}
+    player.src = "/model-manager/segments/audio/" + segId;
+    player.style.display = "block";
+    player.play();
+}}
+
+function closeDetail() {{
+    var modal = document.getElementById("detailModal");
+    if (modal) modal.remove();
+}}
+
+// ── 历史任务列表 ──
+async function showTaskHistory() {{
+    try {{
+        const resp = await fetch("/model-manager/auto-label/tasks");
+        const r = await resp.json();
+        if (!r.success || !r.tasks) {{ alert("加载失败"); return; }}
+        var tasks = r.tasks;
+        var html = '<div id="taskHistoryModal" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999;overflow:auto">'
+            + '<div style="background:#fff;margin:50px auto;max-width:700px;border-radius:8px;padding:20px;position:relative">'
+            + '<a href="javascript:closeTaskHistory()" style="position:absolute;top:12px;right:16px;font-size:20px;text-decoration:none;color:#999">✕</a>'
+            + '<h3>自动打标历史任务</h3>'
+            + '<table class="results-table"><thead><tr><th>ID</th><th>状态</th><th>模型</th><th>处理数</th><th>启动时间</th><th>完成时间</th><th>操作</th></tr></thead><tbody>';
+        for (var ti = 0; ti < tasks.length; ti++) {{
+            var t = tasks[ti];
+            var statusIcon = {{pending:"⏳", running:"⏳", completed:"✅", failed:"❌"}}[t.status] || "—";
+            html += '<tr><td>' + t.id + '</td><td>' + statusIcon + ' ' + t.status + '</td>'
+                + '<td>' + (t.model_name || "-") + '</td>'
+                + '<td>' + (t.processed || 0) + '/' + (t.total_segments || 0) + '</td>'
+                + '<td style="font-size:11px">' + (t.started_at || "").substring(0, 19) + '</td>'
+                + '<td style="font-size:11px">' + (t.completed_at || "").substring(0, 19) + '</td>';
+            if (t.status === "completed") {{
+                html += '<td><a href="javascript:loadTaskResults(' + t.id + ')" style="font-size:11px">查看结果</a>'
+                    + ' <a href="javascript:deleteTask(' + t.id + ')" style="font-size:11px;color:#e74c3c;margin-left:8px">🗑 删除</a></td>';
+            }} else {{
+                html += '<td><a href="javascript:deleteTask(' + t.id + ')" style="font-size:11px;color:#e74c3c">🗑 删除</a></td>';
+            }}
+            html += '</tr>';
+        }}
+        html += '</tbody></table></div></div>';
+        var div = document.createElement("div");
+        div.innerHTML = html;
+        document.body.appendChild(div.firstElementChild);
+    }} catch(e) {{
+        alert("加载历史任务失败: " + e.message);
+    }}
+}}
+
+function closeTaskHistory() {{
+    var modal = document.getElementById("taskHistoryModal");
+    if (modal) modal.remove();
+}}
+
+async function deleteTask(taskId) {{
+    if (!confirm("确定删除任务 #" + taskId + "？该任务的打标结果和中间过程数据将被永久删除。")) return;
+    try {{
+        const resp = await fetch("/model-manager/auto-label/tasks/" + taskId, {{ method: "DELETE" }});
         const r = await resp.json();
         if (r.success) {{
-            alert("已保存 " + (r.saved_count || toSave.length) + " 个片段标签");
+            alert("已删除任务 #" + taskId);
+            // Refresh history list
+            closeTaskHistory();
+            showTaskHistory();
+        }} else {{
+            alert("删除失败: " + (r.error || ""));
+        }}
+    }} catch(e) {{
+        alert("网络错误: " + e.message);
+    }}
+}}
+
+function loadTaskResults(taskId) {{
+    closeTaskHistory();
+    currentTaskId = taskId;
+    isViewingHistory = (latestTaskId !== null && taskId !== latestTaskId);
+    // Show status and load results
+    var statusDiv = document.getElementById("taskStatus");
+    statusDiv.style.display = "block";
+    statusDiv.innerHTML = '📋 加载任务 #' + taskId + ' 的结果' + (isViewingHistory ? '（历史任务，不可确认）' : '') + '...';
+    statusDiv.style.background = "#eaf2f8";
+    pollTask(taskId);
+}}
+
+async function confirmAllResults(taskId) {{
+    if (isViewingHistory) {{
+        alert("历史任务结果不可确认，请运行新的自动打标任务");
+        return;
+    }}
+    if (!confirm("确定将所有自动打标结果保存为正式标签？" + String.fromCharCode(10) + "注意：与已有标签冲突的片段将被覆盖。")) return;
+    // Get all segment IDs from the preview table for this task
+    try {{
+        const resp = await fetch("/model-manager/auto-label/results?task_id=0&per_page=9999");
+        const r = await resp.json();
+        if (!r.success || !r.results || r.results.length === 0) {{
+            alert("没有可确认的结果");
+            return;
+        }}
+        var toSave = [];
+        var conflictCount = 0;
+        for (var i = 0; i < r.results.length; i++) {{
+            toSave.push(r.results[i].segment_id);
+        }}
+        if (toSave.length === 0) {{
+            alert("没有需要保存的片段");
+            return;
+        }}
+        // Find the confirm button by text (event.target is unreliable after confirm dialog)
+        var btns = document.querySelectorAll('button');
+        var btn = null;
+        for (var bi = 0; bi < btns.length; bi++) {{
+            if (btns[bi].textContent.indexOf('确认全部结果') >= 0) {{ btn = btns[bi]; break; }}
+        }}
+        var origText = btn ? btn.textContent : '';
+        if (btn) {{ btn.disabled = true; btn.textContent = "保存中..."; }}
+        const confirmResp = await fetch("/model-manager/run-label", {{
+            method: "POST",
+            headers:{{"Content-Type":"application/json"}},
+            body: JSON.stringify({{confirm_segments: toSave}})
+        }});
+        const cr = await confirmResp.json();
+        if (btn) {{ btn.disabled = false; btn.textContent = origText; }}
+        if (cr.success) {{
+            alert("已保存 " + (cr.saved_count || toSave.length) + " 个片段标签" + (cr.conflict_count ? "，其中 " + cr.conflict_count + " 个覆盖了已有标签" : ""));
             location.reload();
         }} else {{
-            alert("保存失败: " + (r.error || ""));
+            alert("保存失败: " + (cr.error || ""));
         }}
-    }} catch(e) {{ alert("网络错误: " + e.message); }}
-    btn.disabled = false; btn.textContent = origText;
+    }} catch(e) {{
+        alert("网络错误: " + e.message);
+    }}
 }}
 </script>
 </body>

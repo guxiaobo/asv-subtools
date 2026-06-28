@@ -268,19 +268,30 @@ def recover_stuck_tasks(conn: sqlite3.Connection) -> int:
 
 
 def single_instance_lock(name: str, timeout: int = 30) -> bool:
-    """Simple single-instance lock using a lock file."""
+    """Simple single-instance lock using a lock file.
+    
+    If the lock cannot be acquired immediately, retries every 5s
+    up to `timeout` seconds before giving up.
+    """
     lock_path = Path(f"/tmp/asv_{name}.lock")
     try:
         import fcntl
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_path.write_text(str(os.getpid()))
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except (IOError, OSError):
+                if time.monotonic() >= deadline:
+                    logger.error("等待 %s 锁超时 (%ds)，放弃", name, timeout)
+                    return False
+                logger.info("等待 %s 锁释放… (pid=%s)", name, lock_path.read_text().strip())
+                time.sleep(5)
+    except (ImportError, OSError) as e:
+        logger.warning("锁机制不可用 (%s)，跳过", e)
         return True
-    except (IOError, OSError, ImportError):
-        if lock_path.exists():
-            pid = lock_path.read_text().strip()
-            logger.warning("Lock held by PID %s (or stale)", pid)
-        return False
 
 
 # ---------------------------------------------------------------------------

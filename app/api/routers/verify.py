@@ -339,3 +339,71 @@ async def verify_indirect(
     )
 
     return result
+
+
+
+
+@router.get("/debug/embedding-test")
+async def debug_embedding_test():
+    """临时调试：测试embedding区分度（多段对比）。"""
+    import numpy as np, sqlite3
+    from pathlib import Path
+    try:
+        vf = _get_verifier()
+    except RuntimeError:
+        return {"error": "verifier not init"}
+    
+    # Pick segments from different positions in each recording (first, middle, last)
+    conn = sqlite3.connect("/Users/guxiaobo/Documents/GitHub/asv-subtools/app/data/training.db")
+    conn.row_factory = sqlite3.Row
+    
+    # Get segments from 4 different recordings
+    test_segs = []
+    for rec_id in [1, 4, 10, 20]:
+        rows = conn.execute(
+            "SELECT id, file_path, segment_index, recording_id FROM audio_segments "
+            "WHERE recording_id=? AND (is_ignored IS NULL OR is_ignored=0) "
+            "ORDER BY segment_index", (rec_id,)
+        ).fetchall()
+        if rows:
+            # First, middle, last segment
+            picks = [rows[0], rows[len(rows)//2], rows[-1]]
+            for r in picks:
+                test_segs.append(dict(r))
+    conn.close()
+    
+    embs = {}
+    info = []
+    for s in test_segs:
+        path = Path(s["file_path"])
+        if not path.exists():
+            continue
+        ad = vf._audio_loader.load_from_file(str(path))
+        emb = vf._compute_embedding(ad)
+        key = f"rec{s['recording_id']}_seg{s['segment_index']}"
+        embs[key] = emb
+        info.append({"key": key, "seg_id": s["id"], "seg_index": s["segment_index"], "recording_id": s["recording_id"]})
+    
+    # Pairwise cosine — group by same recording vs different
+    import itertools
+    same_rec = []
+    diff_rec = []
+    keys = list(embs.keys())
+    for i in range(len(keys)):
+        for j in range(i+1, len(keys)):
+            a, b = embs[keys[i]], embs[keys[j]]
+            cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
+            ri = info[i]["recording_id"]
+            rj = info[j]["recording_id"]
+            entry = {"pair": f"{keys[i]} vs {keys[j]}", "cosine": round(cos, 4), "same_recording": ri == rj}
+            if ri == rj:
+                same_rec.append(entry)
+            else:
+                diff_rec.append(entry)
+    
+    return {
+        "segments_tested": len(keys),
+        "same_recording_pairs": same_rec,
+        "different_recording_pairs": diff_rec,
+        "embedding_dim": len(list(embs.values())[0]) if embs else 0,
+    }
